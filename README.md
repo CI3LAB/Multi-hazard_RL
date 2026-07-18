@@ -1,49 +1,48 @@
-# Multi-hazard Lifecycle RL (Final S7)
+# Multi-hazard Lifecycle RL
 
 Lifecycle management of infrastructure under multi-recurrent hazards using simulation-informed modelling and CEM-based threshold-policy search.
 
-This package contains the **final frozen experimental setup (S7)** used for the paper figures, ablation/sensitivity tables, uncertainty estimates, and CEM–GA–PSO comparison.
+This repository provides the source code, case configurations, and paper results for the lifecycle cases, sensitivity/ablation analysis, uncertainty evaluation, and CEM–GA–PSO comparison.
 
-## Frozen parameters (S7)
+## Key parameters
 
 | Item | Value |
 |---|---|
-| Fire rates (baseline / fire-dom. / eq-dom.) | `0.20 / 0.40 / 0.10` per year |
-| Earthquake rates (baseline / fire-dom. / eq-dom.) | `0.025 / 0.0125 / 0.05` per year |
+| Fire rates (baseline / fire-dominant / earthquake-dominant) | `0.20 / 0.40 / 0.10` per year |
+| Earthquake rates (baseline / fire-dominant / earthquake-dominant) | `0.025 / 0.0125 / 0.05` per year |
 | Maintenance costs | `[0.0, 0.25, 0.6]` |
 | Deterioration rates `det_alpha_T_levels` | `[0.8, 0.4, 0.2]` |
-| Repair rate | `0.25 / year` (continuous recovery) |
+| Repair recovery rate | `0.25 / year` |
 | Repair durations | `[0.0, 1.0, 1.5]` years |
-| CEM budget | 200 iterations, population 80, 30 eval episodes |
-| Holdout / uncertainty | 400 episodes |
+| CEM settings | 200 iterations, population 80, 30 evaluation episodes |
+| Holdout / uncertainty episodes | 400 |
 
-See `results/RL_Code/lcc_rerun/FINAL_S7_PARAMETERS.json`.
+See `results/RL_Code/lcc_rerun/PARAMETERS.json`.
 
 ## Repository layout
 
 ```
-code/RL_Code/                 # runnable source + case configs
-results/RL_Code/lcc_rerun/    # final paper figures + slim result summaries
+code/RL_Code/                 # source code and case configs
+results/RL_Code/lcc_rerun/    # figures and numerical summaries
 ```
 
-### Code (main entry points)
+### Main scripts
 
-- `train_lifecycle_rl.py` — lifecycle simulation + CEM training / plotting
-- `ablation_experiment.py` — sensitivity / ablation study
+- `train_lifecycle_rl.py` — lifecycle simulation, CEM training, and case plotting
+- `ablation_experiment.py` — sensitivity and ablation analysis
 - `optimizer_baseline_experiment.py` — GA / PSO / CEM comparison
-- `evaluate_uncertainty.py` — mean ± 95% CI half-width (N=400)
-- `plot_lcc_combined.py` — training-dynamics combined figures
-- `run_final_s7_experiments.sh` — full sequential experiment suite
+- `evaluate_uncertainty.py` — mean ± 95% CI half-width evaluation
+- `plot_lcc_combined.py` — training-dynamics figures
+- `run_all_experiments.sh` — sequential experiment suite
 
-### Results included
+### Results
 
-- Case 1–3 paper figures (`process_iterations`, `cost/lr/risk_over_time`)
-- Training-dynamics panels (`fig/rl_eval_*.png`)
-- Ablation metric bars + multi-objective trade-off
-- Uncertainty table (`uncertainty_results/`)
-- Optimizer comparison summary (`optimizer_baselines/`)
-- Slim JSON summaries (`*.slim.json`) with configs, best params, holdout metrics, and training history  
-  (full episode trajectories are omitted to keep the repo size practical)
+- Case 1–3 lifecycle figures
+- Training-dynamics panels
+- Ablation metric bars and multi-objective trade-off
+- Uncertainty table
+- Optimizer comparison summary
+- Result JSON files with configs, best parameters, holdout metrics, and training history
 
 ## Environment
 
@@ -53,24 +52,21 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-## Re-run / replot (optional)
-
-From the repository root:
+## Usage
 
 ```bash
 export PYTHONPATH="$PWD/code/RL_Code"
 export MPLCONFIGDIR="$PWD/.mplconfig"
 
-# Full formal suite (long-running)
-bash code/RL_Code/run_final_s7_experiments.sh
+# Full experiment suite
+bash code/RL_Code/run_all_experiments.sh
 
-# Or replot ablation figures from existing summaries
+# Replot ablation figures from existing results
 python code/RL_Code/ablation_experiment.py --plot-only \
   --out-root results/RL_Code/lcc_rerun/ablation_results
 ```
 
 ## Notes
 
-- Large intermediate probes, hazard-sweep trials, `old coding/`, logs, and `.venv` are **not** included.
-- Ablation/uncertainty returns use the paper-comparable raw scalarisation under each setting’s weights; do not rank return values across different weight settings.
+- Return values in objective-sensitivity cases use each case’s own weight setting and should not be ranked across different weight formulations.
 - Optimizer comparison uses a common holdout seed set under the baseline lifecycle configuration.
