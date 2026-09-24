@@ -20,25 +20,17 @@
     "c_1": 1.0,
     "c_2": 4.0,
     "c_3": 10.0,
-    "deterioration_model": "weibull",
     "det_alpha_T_levels": [
       0.8,
-      0.4,
+      0.45,
       0.2
     ],
     "det_tau_years": 55.0,
     "det_k": 2.2,
-    "det_sigma": 0.0,
-    "base_deterioration_rate": 0.03,
     "maint_costs": [
       0.0,
       0.25,
       0.6
-    ],
-    "maint_rate_multipliers": [
-      1.0,
-      0.7,
-      0.45
     ],
     "repair_costs": [
       0.0,
@@ -47,28 +39,46 @@
     ],
     "repair_recovery_deltas": [
       0.0,
-      0.25,
-      0.5
+      0.15,
+      0.3
+    ],
+    "repair_durations_years": [
+      0.0,
+      1.0,
+      1.5
+    ],
+    "pre_cost_options": [
+      5.0,
+      10.0,
+      20.0
+    ],
+    "pre_hazard_damage_multipliers": [
+      1.0,
+      0.95,
+      0.88
+    ],
+    "eq_intensities": [
+      0.1,
+      0.3,
+      0.6
+    ],
+    "fire_intensities": [
+      0.1,
+      0.2,
+      0.3
     ],
     "discount_rate": 0.03,
-    "objective_cost_metric": "lcc",
-    "w_floor": 0.0,
-    "repair_stop_years": 0.0,
+    "objective_cost_metric": "npv",
+    "objective_normalization": "reference",
     "lambda_eq_per_year": 0.025,
     "lambda_fire_per_year": 0.2,
     "w_lr": 0.15,
     "w_risk": 0.7,
     "w_cost": 0.15,
-    "objective_normalization": "reference",
     "lr_ref": 10.296414878703919,
     "risk_ref": 1.676,
     "cost_ref": 4.486480000000001,
-    "repair_recovery_rate_per_year": 0.25,
-    "repair_durations_years": [
-      0.0,
-      1.0,
-      1.5
-    ]
+    "record_dt_years": 0.25
   },
   "cem": {
     "iterations": 200,
@@ -76,7 +86,8 @@
     "elite_frac": 0.2,
     "eval_episodes": 30,
     "seed": 20260301,
-    "plot_first_n": 40,
+    "compare_seed_offset": 4677,
+    "plot_first_n": 16,
     "plot_interval": 3
   }
 }

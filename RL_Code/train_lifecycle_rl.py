@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import atexit
 import json
 import logging
 import math
+import multiprocessing as mp
 import os
 import shutil
 import sys
 import time
+from concurrent.futures import ProcessPoolExecutor
 from copy import deepcopy
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime
@@ -17,7 +20,6 @@ from typing import Any
 # stacks are loaded together in the same process.
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
-from matplotlib.collections import LineCollection
 from matplotlib import font_manager
 import matplotlib.pyplot as plt
 import numpy as np
@@ -38,12 +40,90 @@ _TEX_MED_WIDTH_IN = _TEX_TEXTWIDTH_IN * 0.72
 _LINEWIDTH_SCALE = 0.6
 _PLOT_TITLES = False
 
-_TABLE2_EQ_DF_LEVELS: tuple[float, float, float] = (0.10, 0.40, 0.70)
+_TABLE2_EQ_DF_LEVELS: tuple[float, float, float] = (0.10, 0.30, 0.60)
 _TABLE2_FIRE_DF_LEVELS: tuple[float, float, float] = (0.10, 0.20, 0.30)
 
 
 def _lw(x: float) -> float:
     return float(x) * float(_LINEWIDTH_SCALE)
+
+
+# F_crit / F_1 / F_2 threshold lines: khaki, orange, red.
+_F_THRESH_KHAKI = "#C6A664"
+_F_THRESH_ORANGE = "#E67E22"
+_F_THRESH_RED = "#C0392B"
+
+
+def _draw_f_threshold_lines(
+    ax: Any,
+    cfg: "LifecycleConfig",
+    *,
+    f_crit_line: float | None = None,
+    with_labels: bool = False,
+    use_tex_lw: bool = True,
+) -> None:
+    fcrit = cfg.f_crit if f_crit_line is None else float(f_crit_line)
+    lw_c = _lw(1.2) if use_tex_lw else 1.2
+    lw_12 = _lw(1.0) if use_tex_lw else 1.0
+    kw_c: dict[str, Any] = {
+        "color": _F_THRESH_KHAKI, "linestyle": "--", "linewidth": lw_c}
+    kw_1: dict[str, Any] = {
+        "color": _F_THRESH_ORANGE, "linestyle": "--", "linewidth": lw_12}
+    kw_2: dict[str, Any] = {
+        "color": _F_THRESH_RED, "linestyle": "--", "linewidth": lw_12}
+    if with_labels:
+        kw_c["label"] = r"$F_{crit}$"
+        kw_1["label"] = r"$F_1$"
+        kw_2["label"] = r"$F_2$"
+    ax.axhline(fcrit, **kw_c)
+    ax.axhline(cfg.f_1, **kw_1)
+    ax.axhline(cfg.f_2, **kw_2)
+
+
+def _nice_linear_axis(
+    y_min: float,
+    y_max: float,
+    *,
+    n_ticks: int = 6,
+    pad: float = 0.08,
+    anchor_zero: bool = True,
+) -> tuple[float, float, np.ndarray]:
+    lo = float(y_min) if math.isfinite(float(y_min)) else 0.0
+    hi = float(y_max) if math.isfinite(float(y_max)) else lo + 1.0
+    if hi <= lo:
+        hi = lo + 1.0
+    span = hi - lo
+    lo_p = lo - float(pad) * span
+    hi_p = hi + float(pad) * span
+    if anchor_zero and lo >= 0.0:
+        lo_p = 0.0
+    raw_step = (hi_p - lo_p) / float(max(2, int(n_ticks) - 1))
+    if raw_step <= 0.0:
+        raw_step = 1.0
+    mag = 10.0 ** math.floor(math.log10(raw_step))
+    step = mag
+    for mult in (1.0, 2.0, 2.5, 3.0, 5.0, 10.0):
+        if mult * mag >= raw_step * 0.9:
+            step = mult * mag
+            break
+    lo_tick = math.floor(lo_p / step) * step
+    if anchor_zero and lo >= 0.0:
+        lo_tick = 0.0
+    hi_tick = math.ceil(hi_p / step) * step
+    if hi_tick <= lo_tick:
+        hi_tick = lo_tick + step
+    ticks = np.arange(lo_tick, hi_tick + 0.5 * step, step, dtype=float)
+    return float(lo_tick), float(hi_tick), ticks
+
+
+def _apply_even_ylim(ax: Any, y_min: float, y_max: float, *, n_ticks: int = 6,
+                     pad: float = 0.08, anchor_zero: bool = True) -> None:
+    lo, hi, ticks = _nice_linear_axis(
+        y_min, y_max, n_ticks=n_ticks, pad=pad, anchor_zero=anchor_zero)
+    ax.set_ylim(lo, hi)
+    ax.set_yticks(ticks)
+    ax.set_yticklabels([f"{int(v)}" if abs(v - round(v)) < 1.0e-9 else f"{v:g}"
+                        for v in ticks])
 
 
 _KEY_LINE_EFFECT: list[Any] = []
@@ -124,14 +204,18 @@ class LifecycleConfig:
     c_2: float = 4.0
     c_3: float = 10.0
 
-    pre_cost_options: tuple[float, float, float] = (10.0, 20.0, 30.0)
-    pre_fcrit_multipliers: tuple[float, float, float] = (1.00, 0.9, 0.8)
+    pre_cost_options: tuple[float, float, float] = (5.0, 10.0, 20.0)
+    # Pre-reinforcement does not raise initial functionality. It only reduces
+    # subsequent hazard damage. Deterioration and F_crit are unchanged, so
+    # maintenance and repair remain the aging and recovery levers.
+    pre_f0_options: tuple[float, float, float] = (1.00, 1.00, 1.00)
+    pre_fcrit_multipliers: tuple[float, float, float] = (1.00, 1.00, 1.00)
     pre_hazard_damage_multipliers: tuple[float, float, float] = (
-        1.00, 0.9, 0.8)
+        1.00, 0.95, 0.88)
     pre_deterioration_multipliers: tuple[float, float, float] = (
-        1.00, 0.9, 0.8)
+        1.00, 1.00, 1.00)
     deterioration_model: str = "weibull"
-    det_alpha_T_levels: tuple[float, float, float] = (0.80, 0.40, 0.20)
+    det_alpha_T_levels: tuple[float, float, float] = (0.80, 0.45, 0.20)
     det_tau_years: float = 55.0
     det_k: float = 2.2
     det_sigma: float = 0.0
@@ -141,7 +225,9 @@ class LifecycleConfig:
     maint_rate_multipliers: tuple[float, float, float] = (1.00, 0.70, 0.45)
 
     repair_costs: tuple[float, float, float] = (0.0, 3.0, 10.0)
-    repair_recovery_deltas: tuple[float, float, float] = (0.0, 0.25, 0.50)
+    # Total functionality restored at each repair level, delivered over
+    # repair_durations_years. The live path uses delta/duration as the rate.
+    repair_recovery_deltas: tuple[float, float, float] = (0.0, 0.15, 0.30)
     repair_recovery_rate_per_year: float = 0.25
     repair_durations_years: tuple[float, float, float] = (0.0, 1.0, 1.5)
     hazard_transition_durations: tuple[float, float, float] = (0.5, 1.0, 1.5)
@@ -150,8 +236,11 @@ class LifecycleConfig:
     w_risk: float = 1.0
     w_cost: float = 1.20
     discount_rate: float = 0.03
-    # Cost metric used in objective: "lcc" (discount-neutral) or "npv".
-    objective_cost_metric: str = "lcc"
+    # Cost metric used in objective: "lcc" (undiscounted cash) or "npv"
+    # (exponentially discounted cost). Pre-reinforcement is paid at t=0, so
+    # its discount factor is 1. Maintenance and repair use the interval-average
+    # factor (e^{-γt}-e^{-γ(t+Δt)})/(γΔt).
+    objective_cost_metric: str = "npv"
     # Objective aggregation mode: "reference" divides LR, risk, and selected
     # cost by fixed reference values before weighting.
     objective_normalization: str = "reference"
@@ -186,12 +275,28 @@ class EpisodeResult:
     return_value: float
 
 
+def _clip_lo(x: float, lo: float = 0.0) -> float:
+    v = float(x)
+    return float(lo) if v < lo else v
+
+
 def _clip01(x: float) -> float:
-    if x < 0.0:
+    v = float(x)
+    if v < 0.0:
         return 0.0
-    if x > 1.0:
+    if v > 1.0:
         return 1.0
-    return float(x)
+    return v
+
+
+def _initial_f(cfg: LifecycleConfig, pre_index: int) -> float:
+    idx = int(np.clip(pre_index, 0, len(cfg.pre_f0_options) - 1))
+    return float(max(0.0, cfg.pre_f0_options[idx]))
+
+
+def _f_plot_ylim(cfg: LifecycleConfig) -> tuple[float, float]:
+    f_top = max(1.02, max(float(x) for x in cfg.pre_f0_options) + 0.05)
+    return (-0.02, float(f_top))
 
 
 def _cf(cfg: LifecycleConfig, f: float, f_crit: float) -> float:
@@ -217,12 +322,16 @@ def _case_short_name(name: str) -> str:
 
 
 def _baseline_policy_params() -> PolicyParams:
+    # Prescriptive F_crit rule: no extra pre-reinforcement. Once F drops
+    # below F_crit=0.70, always apply the strongest maintenance and repair
+    # (no intermediate grade). This is a common code-limit policy and is
+    # later and coarser than the CEM schedule.
     return PolicyParams(
         pre_index=0,
         maint_t1=0.70,
-        maint_t2=0.50,
+        maint_t2=0.70,
         repair_t1=0.70,
-        repair_t2=0.50,
+        repair_t2=0.70,
     )
 
 
@@ -248,6 +357,12 @@ def _hazard_level_index_from_intensity(
     if nearest in [float(v) for v in eq_levels]:
         return int([float(v) for v in eq_levels].index(nearest))
     return int([float(v) for v in fire_levels].index(nearest))
+
+
+def _maint_feature(f: float, f0: float) -> float:
+    # Thresholds live in [0.05, 0.95]. F/F0 is kept so a later F0 reserve,
+    # if re-enabled, would not change the maintenance schedule.
+    return float(f) / max(float(f0), 1.0e-12)
 
 
 def _choose_maint(params: PolicyParams, f: float) -> int:
@@ -380,7 +495,7 @@ def _lr_increment_pdf(
         return 0.0
     if gamma <= 1.0e-12:
         f_mid = 0.5 * (float(f0) + float(f1))
-        return float((1.0 - f_mid) * dt)
+        return float(max(0.0, 1.0 - f_mid) * dt)
 
     f0 = float(f0)
     f1 = float(f1)
@@ -477,9 +592,12 @@ def simulate_episode(cfg: LifecycleConfig, params: PolicyParams, seed: int, *, r
                     len(cfg.pre_cost_options) - 1))
     f_crit_eff = _effective_f_crit(cfg, pre_index)
 
-    f = 1.0
-    cost = float(cfg.pre_cost_options[pre_index])
-    npv = float(cfg.pre_cost_options[pre_index])
+    f = _initial_f(cfg, pre_index)
+    f_init = float(f)
+    pre_cost = float(cfg.pre_cost_options[pre_index])
+    cost = pre_cost
+    # Pre-reinforcement occurs only at t=0; the discount factor is 1.
+    npv = pre_cost * _discount_factor(cfg.discount_rate, 0.0)
     det_mult = float(cfg.pre_deterioration_multipliers[pre_index])
     haz_mult = float(cfg.pre_hazard_damage_multipliers[pre_index])
 
@@ -493,7 +611,7 @@ def simulate_episode(cfg: LifecycleConfig, params: PolicyParams, seed: int, *, r
     min_f = float(f)
     feasible = True
 
-    maint_level = _choose_maint(params, f)
+    maint_level = _choose_maint(params, _maint_feature(f, f_init))
     maint_interval_years = float(cfg.maintenance_interval_years)
 
     eq_intensities = cfg.hazard_intensities if cfg.eq_intensities is None else cfg.eq_intensities
@@ -537,7 +655,7 @@ def simulate_episode(cfg: LifecycleConfig, params: PolicyParams, seed: int, *, r
                                * decision_dt) <= 1.0e-9
         if is_year_boundary and t > 0.0 and maint_interval_years > 0.0:
             if abs((t % maint_interval_years)) <= 1.0e-9:
-                maint_level = _choose_maint(params, f)
+                maint_level = _choose_maint(params, _maint_feature(f, f_init))
                 maint_cost = float(cfg.maint_costs[maint_level])
                 cost += maint_cost
                 npv += maint_cost * \
@@ -565,7 +683,7 @@ def simulate_episode(cfg: LifecycleConfig, params: PolicyParams, seed: int, *, r
             for intensity in events:
                 intensity_eff = float(intensity) * haz_mult
                 f_before_damage = float(f)
-                f_after_damage = _clip01(float(f) - float(intensity_eff))
+                f_after_damage = _clip_lo(float(f) - float(intensity_eff))
                 event_drop = max(0.0, f_before_damage - f_after_damage)
                 if event_drop > 0.0:
                     event_cf = _cf(cfg, f_after_damage, f_crit=f_crit_eff)
@@ -584,13 +702,13 @@ def simulate_episode(cfg: LifecycleConfig, params: PolicyParams, seed: int, *, r
                     _avg_discount_factor(cfg.discount_rate, t, min(
                         horizon_years, t + decision_dt))
                 repair_duration = float(cfg.repair_durations_years[repair_level])
-                repair_rate = max(0.0, float(cfg.repair_recovery_rate_per_year))
-                if repair_duration > 0.0 and repair_rate > 0.0:
+                repair_delta = float(cfg.repair_recovery_deltas[repair_level])
+                if repair_duration > 0.0 and repair_delta > 0.0:
                     active_procs.append(
                         {
                             "delay": 0.0,
                             "remaining": repair_duration,
-                            "rate": repair_rate,
+                            "rate": repair_delta / repair_duration,
                         }
                     )
                 if record_hazard_steps:
@@ -617,14 +735,18 @@ def simulate_episode(cfg: LifecycleConfig, params: PolicyParams, seed: int, *, r
             if cfg.det_sigma > 0.0:
                 delta_alpha *= float(rng.lognormal(mean=0.0,
                                      sigma=float(cfg.det_sigma)))
-            f = _clip01(f - delta_alpha)
+            f = _clip_lo(f - delta_alpha)
         else:
             det_rate = cfg.base_deterioration_rate * det_mult * \
                 cfg.maint_rate_multipliers[maint_level]
             det_rate *= float(rng.lognormal(mean=0.0, sigma=0.15))
-            f = _clip01(f - det_rate * dt_seg)
+            f = _clip_lo(f - det_rate * dt_seg)
 
-        f = _clip01(float(f) + _apply_procs(dt_seg))
+        repair_delta = float(_apply_procs(dt_seg))
+        f = float(f) + repair_delta
+        if repair_delta > 0.0:
+            f = min(1.0, f)
+        f = _clip_lo(f)
         f1 = float(f)
 
         f_mid = 0.5 * (f0 + f1)
@@ -685,6 +807,8 @@ class CEMState:
     mu: np.ndarray
     sigma: np.ndarray
     pre_probs: np.ndarray
+    mu_by_pre: np.ndarray
+    sigma_by_pre: np.ndarray
 
 
 def _setup_logging(log_dir: Path) -> logging.Logger:
@@ -714,24 +838,79 @@ def _setup_logging(log_dir: Path) -> logging.Logger:
 def _init_cem_state() -> CEMState:
     mu = np.array([0.65, 0.50, 0.55, 0.40], dtype=float)
     sigma = np.array([0.08, 0.08, 0.10, 0.10], dtype=float)
-    pre_probs = np.array([0.60, 0.25, 0.15], dtype=float)
-    return CEMState(mu=mu, sigma=sigma, pre_probs=pre_probs)
+    pre_probs = np.array([0.40, 0.35, 0.25], dtype=float)
+    mu_by_pre = np.tile(mu, (3, 1))
+    sigma_by_pre = np.tile(sigma, (3, 1))
+    return CEMState(
+        mu=mu,
+        sigma=sigma,
+        pre_probs=pre_probs,
+        mu_by_pre=mu_by_pre,
+        sigma_by_pre=sigma_by_pre,
+    )
+
+
+def _clip_threshold(value: float) -> float:
+    return float(np.clip(value, 0.05, 0.95))
 
 
 def _sample_params(rng: np.random.Generator, state: CEMState) -> PolicyParams:
-    maint_t1, maint_t2, repair_t1, repair_t2 = rng.normal(
-        loc=state.mu, scale=state.sigma).tolist()
-    maint_t1 = float(np.clip(maint_t1, 0.05, 0.95))
-    maint_t2 = float(np.clip(maint_t2, 0.05, 0.95))
-    repair_t1 = float(np.clip(repair_t1, 0.05, 0.95))
-    repair_t2 = float(np.clip(repair_t2, 0.05, 0.95))
     pre_index = int(rng.choice([0, 1, 2], p=state.pre_probs))
+    maint_t1, maint_t2, repair_t1, repair_t2 = rng.normal(
+        loc=state.mu_by_pre[pre_index],
+        scale=state.sigma_by_pre[pre_index],
+    ).tolist()
     return PolicyParams(
         pre_index=pre_index,
-        maint_t1=maint_t1,
-        maint_t2=maint_t2,
-        repair_t1=repair_t1,
-        repair_t2=repair_t2,
+        maint_t1=_clip_threshold(maint_t1),
+        maint_t2=_clip_threshold(maint_t2),
+        repair_t1=_clip_threshold(repair_t1),
+        repair_t2=_clip_threshold(repair_t2),
+    )
+
+
+def _iter_sigma_floor(iteration: int, n_iter: int) -> float:
+    n = max(1, int(n_iter))
+    it = int(iteration)
+    hold = max(1, n // 2)
+    if it < hold:
+        return float(_SIGMA_FLOOR_INIT)
+    denom = float(max(1, n - 1 - hold))
+    frac = float(it - hold) / denom
+    frac = min(1.0, max(0.0, frac))
+    return float(_SIGMA_FLOOR_INIT + (_SIGMA_FLOOR - _SIGMA_FLOOR_INIT) * frac)
+
+
+def _elitist_start_iter(n_iter: int) -> int:
+    return int(math.ceil(0.25 * float(max(1, int(n_iter)))))
+
+
+def _params_key(params: PolicyParams) -> tuple[int, float, float, float, float]:
+    return (
+        int(params.pre_index),
+        float(params.maint_t1),
+        float(params.maint_t2),
+        float(params.repair_t1),
+        float(params.repair_t2),
+    )
+
+
+def _jitter_params(
+    params: PolicyParams,
+    rng: np.random.Generator,
+    *,
+    scale: float,
+) -> PolicyParams:
+    noise = rng.normal(0.0, float(scale), size=4)
+    pre_index = int(params.pre_index)
+    if float(rng.random()) < 0.10:
+        pre_index = int(rng.integers(0, 3))
+    return PolicyParams(
+        pre_index=pre_index,
+        maint_t1=_clip_threshold(float(params.maint_t1) + float(noise[0])),
+        maint_t2=_clip_threshold(float(params.maint_t2) + float(noise[1])),
+        repair_t1=_clip_threshold(float(params.repair_t1) + float(noise[2])),
+        repair_t2=_clip_threshold(float(params.repair_t2) + float(noise[3])),
     )
 
 
@@ -820,19 +999,19 @@ def _select_pareto_final_candidate(
         return None
 
     front_idx = _pareto_front_indices(
-        [{"lcc": float(c["eval"]["lcc"]), "risk": float(c["eval"]["risk"])} for c in candidates],
-        ("lcc", "risk"),
+        [{"npv": float(c["eval"]["npv"]), "risk": float(c["eval"]["risk"])} for c in candidates],
+        ("npv", "risk"),
     )
     front = [candidates[i] for i in front_idx]
 
-    all_lcc = [float(c["eval"]["lcc"]) for c in candidates]
+    all_npv = [float(c["eval"]["npv"]) for c in candidates]
     all_risk = [float(c["eval"]["risk"]) for c in candidates]
     all_lr = [float(c["eval"]["lr"]) for c in candidates]
 
     def rank_key(c: dict[str, Any]) -> tuple[float, float]:
         ev = c["eval"]
         cost_risk_balance = (
-            _norm_minmax(float(ev["lcc"]), all_lcc)
+            _norm_minmax(float(ev["npv"]), all_npv)
             + _norm_minmax(float(ev["risk"]), all_risk)
         )
         complete_objective = cost_risk_balance + 0.25 * _norm_minmax(float(ev["lr"]), all_lr)
@@ -842,20 +1021,20 @@ def _select_pareto_final_candidate(
     selected = dict(selected)
     selected["selection"] = {
         "method": "pareto_cost_risk_then_full_objective",
-        "pareto_objectives": ["lcc", "risk"],
-        "tie_break": "minmax_normalized_lcc_plus_risk_plus_0.25_lr; return as secondary tie-break",
+        "pareto_objectives": ["npv", "risk"],
+        "tie_break": "minmax_normalized_npv_plus_risk_plus_0.25_lr; return as secondary tie-break",
         "candidate_count": int(len(candidates)),
         "pareto_candidate_count": int(len(front)),
     }
     if logger is not None:
         ev = selected["eval"]
         logger.info(
-            "Pareto final selection | iter=%d return=%.4f lr=%.3f risk=%.3f lcc=%.2f front=%d/%d",
+            "Pareto final selection | iter=%d return=%.4f lr=%.3f risk=%.3f npv=%.2f front=%d/%d",
             int(selected["iteration"]),
             float(ev["return"]),
             float(ev["lr"]),
             float(ev["risk"]),
-            float(ev["lcc"]),
+            float(ev["npv"]),
             int(len(front)),
             int(len(candidates)),
         )
@@ -887,14 +1066,6 @@ def _selected_iter_index(iter_trajectories: list[dict[str, Any]]) -> int:
         if ret > best_return:
             best_return = ret
             best_idx = i
-
-    best_idx = _selected_iter_index(iter_trajectories)
-    best_rec_for_plot = iter_trajectories[best_idx]
-    best_score_for_plot = best_rec_for_plot.get("score")
-    if isinstance(best_score_for_plot, dict) and "return" in best_score_for_plot:
-        best_return = float(best_score_for_plot["return"])
-    else:
-        best_return = float(best_rec_for_plot["episode"]["return_value"])
     return best_idx
 
 
@@ -1151,10 +1322,14 @@ def _evaluate_population_torch(
     year_stride = int(round(decision_dt / record_dt))
     year_stride = int(max(1, year_stride))
 
-    f = torch.ones(batch, device=device, dtype=torch.float32)
+    f0_opts = torch.tensor(cfg.pre_f0_options, device=device, dtype=torch.float32)
+    f = f0_opts[torch.clamp(pre_index, 0, int(len(cfg.pre_f0_options) - 1))]
+    f_init = f.clone()
     cost = torch.tensor([float(cfg.pre_cost_options[int(i)])
                         for i in pre_index.tolist()], device=device, dtype=torch.float32)
-    npv = cost.clone()
+    # Pre-reinforcement occurs only at t=0; the discount factor is 1.
+    pre_disc = float(_discount_factor(float(cfg.discount_rate), 0.0))
+    npv = cost * pre_disc
 
     det_mult = torch.tensor(cfg.pre_deterioration_multipliers, device=device, dtype=torch.float32)[
         torch.clamp(pre_index, 0, int(len(cfg.pre_deterioration_multipliers) - 1))]
@@ -1162,17 +1337,20 @@ def _evaluate_population_torch(
         torch.clamp(pre_index, 0, int(len(cfg.pre_hazard_damage_multipliers) - 1))]
     f_crit_eff = _effective_f_crit_torch(cfg, pre_index).to(torch.float32)
 
-    maint_level = _choose_maint_torch(maint_t1, maint_t2, f)
+    maint_level = _choose_maint_torch(
+        maint_t1, maint_t2, f / torch.clamp(f_init, min=1.0e-12))
     maint_costs = torch.tensor(
         cfg.maint_costs, device=device, dtype=torch.float32)
     repair_costs = torch.tensor(
         cfg.repair_costs, device=device, dtype=torch.float32)
     repair_durations = torch.tensor(
         cfg.repair_durations_years, device=device, dtype=torch.float32)
-    repair_process_rate = torch.tensor(
-        max(0.0, float(cfg.repair_recovery_rate_per_year)),
-        device=device,
-        dtype=torch.float32,
+    repair_deltas = torch.tensor(
+        cfg.repair_recovery_deltas, device=device, dtype=torch.float32)
+    repair_level_rates = torch.where(
+        repair_durations > 1.0e-12,
+        repair_deltas / torch.clamp(repair_durations, min=1.0e-12),
+        torch.zeros_like(repair_durations),
     )
     alpha_T_levels = torch.tensor(
         cfg.det_alpha_T_levels, device=device, dtype=torch.float32)
@@ -1205,7 +1383,8 @@ def _evaluate_population_torch(
 
         is_year_boundary = (s % year_stride) == 0
         if is_year_boundary and s > 0 and maint_interval_steps > 0 and (s % maint_interval_steps) == 0:
-            maint_level = _choose_maint_torch(maint_t1, maint_t2, f)
+            maint_level = _choose_maint_torch(
+                maint_t1, maint_t2, f / torch.clamp(f_init, min=1.0e-12))
             mc = maint_costs[maint_level]
             cost = cost + mc
             if discount_rate > 0.0:
@@ -1229,7 +1408,7 @@ def _evaluate_population_torch(
                     intensity_eff = torch.clamp(intensity, min=0.0) * haz_mult
                     f_before_damage = f
                     f_after_damage = torch.clamp(
-                        f - intensity_eff, min=0.0, max=1.0)
+                        f - intensity_eff, min=0.0)
                     event_drop = torch.clamp(f_before_damage - f_after_damage, min=0.0)
                     event_cf = _cf_torch(cfg, f_after_damage, f_crit_eff)
                     risk = risk + torch.where(
@@ -1251,7 +1430,8 @@ def _evaluate_population_torch(
                         npv = npv + rc
 
                     duration = torch.clamp(repair_durations[repair_level], min=0.0)
-                    pending = has & (duration > 1.0e-12) & (repair_process_rate > 0.0)
+                    level_rate = torch.clamp(repair_level_rates[repair_level], min=0.0)
+                    pending = has & (duration > 1.0e-12) & (level_rate > 1.0e-12)
                     for slot in range(repair_slot_count):
                         empty = repair_remaining[slot] <= 1.0e-12
                         fill = pending & empty
@@ -1260,7 +1440,7 @@ def _evaluate_population_torch(
                                 fill, duration, repair_remaining[slot])
                             repair_rates[slot] = torch.where(
                                 fill,
-                                torch.zeros_like(repair_rates[slot]) + repair_process_rate,
+                                level_rate,
                                 repair_rates[slot],
                             )
                             pending = pending & (~fill)
@@ -1275,7 +1455,7 @@ def _evaluate_population_torch(
                         )
                         repair_rates[last] = torch.where(
                             pending,
-                            repair_rates[last] + repair_process_rate,
+                            repair_rates[last] + level_rate,
                             repair_rates[last],
                         )
 
@@ -1302,7 +1482,7 @@ def _evaluate_population_torch(
         dg = torch.clamp(g1 - g0, min=0.0)
         alpha_T = alpha_T_levels[maint_level]
         delta_alpha = alpha_T * det_mult * dg
-        f = torch.clamp(f - delta_alpha, 0.0, 1.0)
+        f = torch.clamp(f - delta_alpha, min=0.0)
 
         dt_t = torch.tensor(dt_seg, device=device, dtype=torch.float32)
 
@@ -1314,11 +1494,16 @@ def _evaluate_population_torch(
             repair_rates,
             torch.zeros_like(repair_rates),
         )
-        f = torch.clamp(f + repair_delta, 0.0, 1.0)
+        f = f + repair_delta
+        f = torch.where(
+            repair_delta > 0.0,
+            torch.clamp(f, min=0.0, max=1.0),
+            torch.clamp(f, min=0.0),
+        )
 
         f1 = f
         f_mid = 0.5 * (f0 + f1)
-        lr = lr + (1.0 - f_mid) * dt_seg
+        lr = lr + torch.clamp(1.0 - f_mid, min=0.0) * dt_seg
         cf = _cf_torch(cfg, f_mid, f_crit_eff)
         risk = risk + torch.where(cf > 0.0, cf * dt_seg, torch.zeros_like(cf))
         floor_violation = floor_violation + \
@@ -1359,6 +1544,110 @@ def _evaluate_population_torch(
     return out
 
 
+_PRE_PROBS_FLOOR = 0.10
+_SIGMA_FLOOR = 0.02
+_SIGMA_FLOOR_INIT = 0.08
+_SIGMA_CAP = 0.15
+_ELITIST_JITTER_COPIES = 2
+_EVAL_POOL: ProcessPoolExecutor | None = None
+_EVAL_POOL_WORKERS = 0
+
+
+def _cem_worker_count() -> int:
+    raw = str(os.environ.get("CEM_WORKERS", "")).strip()
+    if raw:
+        try:
+            return max(1, int(raw))
+        except ValueError:
+            pass
+    try:
+        n = len(os.sched_getaffinity(0))
+    except Exception:
+        n = int(os.cpu_count() or 1)
+    return max(1, int(n))
+
+
+def _eval_worker_init() -> None:
+    os.environ["OMP_NUM_THREADS"] = "1"
+    os.environ["MKL_NUM_THREADS"] = "1"
+    os.environ["OPENBLAS_NUM_THREADS"] = "1"
+    os.environ["NUMEXPR_NUM_THREADS"] = "1"
+    os.environ.setdefault("MPLCONFIGDIR", "/tmp/mplconfig")
+    os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+
+
+def _eval_params_job(
+    payload: tuple[dict[str, Any], dict[str, Any], int, int],
+) -> dict[str, float]:
+    cfg_dict, params_dict, base_seed, episodes = payload
+    cfg = LifecycleConfig(**_coerce_lifecycle_config_dict(cfg_dict))
+    params = PolicyParams(**params_dict)
+    return _evaluate_params(
+        cfg, params, base_seed=int(base_seed), episodes=int(episodes))
+
+
+def _shutdown_eval_pool() -> None:
+    global _EVAL_POOL, _EVAL_POOL_WORKERS
+    if _EVAL_POOL is not None:
+        _EVAL_POOL.shutdown(wait=True)
+        _EVAL_POOL = None
+        _EVAL_POOL_WORKERS = 0
+
+
+atexit.register(_shutdown_eval_pool)
+
+
+def _mp_context():
+    if sys.platform.startswith("linux"):
+        return mp.get_context("fork")
+    return mp.get_context("spawn")
+
+
+def _get_eval_pool(workers: int) -> ProcessPoolExecutor:
+    global _EVAL_POOL, _EVAL_POOL_WORKERS
+    workers = max(1, int(workers))
+    if _EVAL_POOL is not None and _EVAL_POOL_WORKERS == workers:
+        return _EVAL_POOL
+    _shutdown_eval_pool()
+    _EVAL_POOL = ProcessPoolExecutor(
+        max_workers=workers,
+        mp_context=_mp_context(),
+        initializer=_eval_worker_init,
+    )
+    _EVAL_POOL_WORKERS = workers
+    return _EVAL_POOL
+
+
+def evaluate_policy_population(
+    cfg: LifecycleConfig,
+    population: list[PolicyParams],
+    *,
+    base_seed_it: int,
+    episodes: int,
+) -> list[dict[str, float]]:
+    pop_n = int(len(population))
+    if pop_n <= 0:
+        return []
+    workers = min(_cem_worker_count(), pop_n)
+    if workers <= 1:
+        return [
+            _evaluate_params(
+                cfg,
+                p,
+                base_seed=int(base_seed_it + j * 131),
+                episodes=int(episodes),
+            )
+            for j, p in enumerate(population)
+        ]
+    cfg_dict = asdict(cfg)
+    jobs = [
+        (cfg_dict, asdict(p), int(base_seed_it + j * 131), int(episodes))
+        for j, p in enumerate(population)
+    ]
+    pool = _get_eval_pool(workers)
+    return list(pool.map(_eval_params_job, jobs, chunksize=1))
+
+
 def train_cem(
     cfg: LifecycleConfig,
     cem_cfg: CEMConfig,
@@ -1378,26 +1667,40 @@ def train_cem(
     compare_seed = _compare_seed_from_config(cem_cfg)
     device = _torch_device()
     use_gpu = (device == "cuda")
+    workers = _cem_worker_count()
     if use_gpu:
         logger.info("Eval backend | torch device=%s", device)
+    elif workers > 1:
+        logger.info("Eval backend | numpy process pool workers=%d", workers)
     else:
         logger.info("Eval backend | numpy cpu")
 
+    elitist_start = _elitist_start_iter(cem_cfg.iterations)
     logger.info(
-        "CEM start | iterations=%d population=%d elite_frac=%.3f eval_episodes=%d seed=%d",
+        "CEM start | iterations=%d population=%d elite_frac=%.3f eval_episodes=%d seed=%d elitist_start=%d sigma_floor=%.3f->%.3f after_half",
         cem_cfg.iterations,
         cem_cfg.population,
         cem_cfg.elite_frac,
         cem_cfg.eval_episodes,
         cem_cfg.seed,
+        int(elitist_start),
+        float(_SIGMA_FLOOR_INIT),
+        float(_SIGMA_FLOOR),
     )
     if iter_trajectories_path is not None:
         logger.info("Checkpoint | iter_trajectories_path=%s",
                     str(iter_trajectories_path))
 
     for it in range(cem_cfg.iterations):
+        sigma_floor = _iter_sigma_floor(it, cem_cfg.iterations)
         population = [_sample_params(rng, state)
                       for _ in range(cem_cfg.population)]
+        if (
+            best_params is not None
+            and it >= elitist_start
+            and cem_cfg.population > 0
+        ):
+            population[0] = best_params
         base_seed_it = int(cem_cfg.seed + it * 7919)
         if use_gpu:
             scores = _evaluate_population_torch(
@@ -1408,31 +1711,55 @@ def train_cem(
                 device=device,
             )
         else:
-            scores = [
-                _evaluate_params(
-                    cfg,
-                    p,
-                    base_seed=int(base_seed_it + j * 131),
-                    episodes=cem_cfg.eval_episodes,
-                )
-                for j, p in enumerate(population)
-            ]
+            scores = evaluate_policy_population(
+                cfg,
+                population,
+                base_seed_it=base_seed_it,
+                episodes=cem_cfg.eval_episodes,
+            )
 
         order = np.argsort([-s["return"] for s in scores]).tolist()
         elites = [population[i] for i in order[:elite_k]]
         elite_scores = [scores[i] for i in order[:elite_k]]
 
-        elite_mat = np.array(
-            [[e.maint_t1, e.maint_t2, e.repair_t1, e.repair_t2] for e in elites], dtype=float)
-        mu = elite_mat.mean(axis=0)
-        sigma = elite_mat.std(axis=0) + 1e-4
-
         pre_counts = np.zeros_like(state.pre_probs)
         for e in elites:
             pre_counts[e.pre_index] += 1.0
-        pre_probs = (pre_counts / pre_counts.sum()).astype(float)
+        if float(pre_counts.sum()) <= 0.0:
+            pre_probs = np.ones_like(state.pre_probs) / float(len(state.pre_probs))
+        else:
+            pre_probs = (pre_counts / pre_counts.sum()).astype(float)
+        pre_probs = np.maximum(pre_probs, float(_PRE_PROBS_FLOOR))
+        pre_probs = (pre_probs / pre_probs.sum()).astype(float)
 
-        state = CEMState(mu=mu, sigma=sigma, pre_probs=pre_probs)
+        mu_by_pre = np.array(state.mu_by_pre, dtype=float).copy()
+        sigma_by_pre = np.array(state.sigma_by_pre, dtype=float).copy()
+        for pre_k in range(3):
+            group = [e for e in elites if int(e.pre_index) == pre_k]
+            if group:
+                elite_mat = np.array(
+                    [[e.maint_t1, e.maint_t2, e.repair_t1, e.repair_t2]
+                     for e in group],
+                    dtype=float,
+                )
+                mu_by_pre[pre_k] = elite_mat.mean(axis=0)
+                sigma_by_pre[pre_k] = elite_mat.std(axis=0) + 1e-4
+            else:
+                sigma_by_pre[pre_k] = np.minimum(
+                    sigma_by_pre[pre_k] * 1.05, float(_SIGMA_CAP))
+            sigma_by_pre[pre_k] = np.maximum(
+                sigma_by_pre[pre_k], float(sigma_floor))
+
+        log_pre = int(elites[0].pre_index) if elites else int(np.argmax(pre_probs))
+        mu = mu_by_pre[log_pre]
+        sigma = sigma_by_pre[log_pre]
+        state = CEMState(
+            mu=mu,
+            sigma=sigma,
+            pre_probs=pre_probs,
+            mu_by_pre=mu_by_pre,
+            sigma_by_pre=sigma_by_pre,
+        )
 
         best_idx = order[0]
         it_best_params = population[best_idx]
@@ -1585,11 +1912,39 @@ def train_cem(
     return result
 
 
-def _iter_color(i: int, n: int) -> tuple[tuple[float, float, float, float], float, float]:
-    color = (0.2, 0.5, 0.8, 1.0)
-    alpha = 1.0
-    linewidth = _lw(1.0)
-    return color, alpha, linewidth
+_TRAIN_TRACE_RGB = (0.22, 0.50, 0.82)
+_TRAIN_TRACE_ALPHA = 0.58
+_TRAIN_TRACE_LW = 1.0
+
+
+def _plot_training_trace(ax: Any, t: Any, y: Any) -> None:
+    ax.plot(
+        t,
+        y,
+        color=_TRAIN_TRACE_RGB,
+        alpha=_TRAIN_TRACE_ALPHA,
+        linewidth=max(0.6, _lw(_TRAIN_TRACE_LW)),
+        zorder=2,
+        solid_capstyle="round",
+        solid_joinstyle="round",
+    )
+
+
+def _training_plot_indices(
+    n: int,
+    plot_first_n: int | None,
+    plot_interval: int,
+) -> list[int]:
+    if plot_first_n is None:
+        n_show = int(n)
+    else:
+        n_show = int(max(0, min(n, plot_first_n)))
+    step = int(max(1, plot_interval))
+    indices = sorted(set(range(0, n_show, step)))
+    # Drop the untrained start (iter 0); it is an extreme outlier on LR/risk.
+    if len(indices) > 1 and indices[0] == 0:
+        indices = indices[1:]
+    return indices
 
 
 def _plot_iterations(
@@ -1614,29 +1969,6 @@ def _plot_iterations(
     ax_compare = fig.add_subplot(gs[0, 2])
     ax_params = fig.add_subplot(gs[1, 2])
     ax_improve = fig.add_subplot(gs[2, 2])
-
-    window_years = 30.0
-    interval = float(cfg.maintenance_interval_years)
-    decision_times = np.arange(0.0, float(
-        cfg.horizon_years) + 1.0e-9, interval, dtype=float)
-
-    def _add_fade_windows(ax: Any, t: np.ndarray, y: np.ndarray, rgb: tuple[float, float, float], base_alpha: float, base_lw: float) -> None:
-        for s in decision_times:
-            m = (t >= s) & (t <= s + window_years + 1.0e-9)
-            tt = t[m]
-            yy = y[m]
-            if tt.size < 2:
-                continue
-            pts = np.column_stack([tt, yy]).astype(float)
-            segs = np.stack([pts[:-1], pts[1:]], axis=1)
-            mid_t = 0.5 * (tt[:-1] + tt[1:])
-            fade = 1.0 - np.clip((mid_t - s) / window_years, 0.0, 1.0)
-            alphas = (base_alpha * (fade**1.35)).astype(float)
-            colors = np.column_stack([np.full_like(alphas, rgb[0]), np.full_like(
-                alphas, rgb[1]), np.full_like(alphas, rgb[2]), alphas])
-            lc = LineCollection(segs, colors=colors, linewidths=float(
-                base_lw), capstyle="round", joinstyle="round", zorder=2)
-            ax.add_collection(lc)
 
     n = len(iter_trajectories)
 
@@ -1666,14 +1998,7 @@ def _plot_iterations(
             best_return = ret
             best_idx = i
 
-    if plot_first_n is None:
-        n_show = n
-    else:
-        n_show = int(max(0, min(n, plot_first_n)))
-    plot_interval = int(max(1, plot_interval))
-
-    plot_indices = list(range(0, n_show, plot_interval))
-    plot_indices = sorted(set(plot_indices))
+    plot_indices = _training_plot_indices(n, plot_first_n, plot_interval)
 
     for i in plot_indices:
         rec = iter_trajectories[i]
@@ -1681,10 +2006,8 @@ def _plot_iterations(
         t = np.array(ep["t_years"], dtype=float)
         f = np.array(ep["f"], dtype=float)
         cc = np.array(ep["cumulative_cost"], dtype=float)
-        color, alpha, lw = _iter_color(i, n)
-        rgb = (float(color[0]), float(color[1]), float(color[2]))
-        _add_fade_windows(ax_f, t, f, rgb, alpha, lw)
-        _add_fade_windows(ax_c, t, cc, rgb, alpha, lw)
+        _plot_training_trace(ax_f, t, f)
+        _plot_training_trace(ax_c, t, cc)
 
     compare_seed = int(iter_trajectories[0].get("compare_seed", 0))
     baseline_ep = simulate_episode(
@@ -1710,15 +2033,10 @@ def _plot_iterations(
               label="RL-optimized", zorder=31, alpha=1.0,
               path_effects=_KEY_LINE_EFFECT)
 
-    ax_f.axhline(cfg.f_crit if f_crit_line is None else float(
-        f_crit_line), color="tab:red", linestyle="--", linewidth=1.2, label="$F_{crit}$")
-    ax_f.axhline(cfg.f_1, color="tab:orange", linestyle="--",
-                 linewidth=1.0, label="$F_1$")
-    ax_f.axhline(cfg.f_2, color="tab:purple", linestyle="--",
-                 linewidth=1.0, label="$F_2$")
+    _draw_f_threshold_lines(ax_f, cfg, f_crit_line=f_crit_line, with_labels=True, use_tex_lw=False)
 
     ax_f.set_ylabel("Functionality F(t)", fontsize=11)
-    ax_f.set_ylim(-0.02, 1.02)
+    ax_f.set_ylim(*_f_plot_ylim(cfg))
     ax_f.set_xlim(0.0, float(cfg.horizon_years))
     ax_f.grid(True, alpha=0.25)
     ax_f.legend(loc="lower left", fontsize=9)
@@ -1771,7 +2089,7 @@ def _plot_iterations(
         f"{'─' * 16}\n"
         f"Red = Fixed-rule\n"
         f"Green = RL-optimized\n"
-        f"Blue gradient = Training"
+        f"Light blue = Training"
     )
     ax_legend.text(0.1, 0.5, legend_text, transform=ax_legend.transAxes, fontsize=10, verticalalignment="center",
                    fontfamily="monospace", bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.5))
@@ -1794,10 +2112,7 @@ def _plot_iterations(
     ax_compare.plot(t_best, f_best, color="tab:green",
                     linewidth=_lw(2.0), label="RL-optimized",
                     alpha=1.0, zorder=31, path_effects=_KEY_LINE_EFFECT)
-    ax_compare.axhline(cfg.f_crit if f_crit_line is None else float(
-        f_crit_line), color="tab:red", linestyle="--", linewidth=_lw(1.0))
-    ax_compare.axhline(cfg.f_2, color="tab:purple",
-                       linestyle="--", linewidth=_lw(0.8))
+    _draw_f_threshold_lines(ax_compare, cfg, f_crit_line=f_crit_line)
     ax_compare.set_ylabel("F(t)", fontsize=10)
     ax_compare.set_xlabel("Time (years)", fontsize=10)
     if _PLOT_TITLES:
@@ -1805,7 +2120,7 @@ def _plot_iterations(
                              fontsize=10, fontweight="bold")
     ax_compare.legend(loc="lower left", fontsize=8)
     ax_compare.grid(True, alpha=0.25)
-    ax_compare.set_ylim(-0.02, 1.02)
+    ax_compare.set_ylim(*_f_plot_ylim(cfg))
 
     # Show params evolution
     pre_indices = [rec["params"]["pre_index"] for rec in iter_trajectories]
@@ -1864,14 +2179,9 @@ def _plot_best_detail(cfg: LifecycleConfig, best_episode: dict[str, Any], out_pa
         color = plt.cm.Greens(0.80)
         ax_f.plot(t, f, color=color, linewidth=_lw(2.6))
         ax_f.fill_between(t, 1.0, f, color=color, alpha=0.10)
-        ax_f.axhline(cfg.f_crit if f_crit_line is None else float(
-            f_crit_line), color="tab:red", linestyle="--", linewidth=_lw(1.2))
-        ax_f.axhline(cfg.f_1, color="tab:orange",
-                     linestyle="--", linewidth=_lw(1.0))
-        ax_f.axhline(cfg.f_2, color="tab:purple",
-                     linestyle="--", linewidth=_lw(1.0))
+        _draw_f_threshold_lines(ax_f, cfg, f_crit_line=f_crit_line)
         ax_f.set_ylabel("Functionality F(t)")
-        ax_f.set_ylim(-0.02, 1.02)
+        ax_f.set_ylim(*_f_plot_ylim(cfg))
         ax_f.grid(True, alpha=0.25)
 
         ax_c.plot(t, cc, color=color, linewidth=_lw(2.0))
@@ -1902,60 +2212,16 @@ def _plot_f_over_time_by_iteration(
                 _TEX_HALF_WIDTH_IN, _TEX_HALF_WIDTH_IN * 0.72),
         )
 
-        window_years = 30.0
-        interval = float(cfg.maintenance_interval_years)
-        decision_times = np.arange(0.0, float(
-            cfg.horizon_years) + 1.0e-9, interval, dtype=float)
-
-        def _add_fade_windows(
-            ax: Any,
-            t: np.ndarray,
-            y: np.ndarray,
-            rgb: tuple[float, float, float],
-            base_alpha: float,
-            base_lw: float,
-        ) -> None:
-            for s in decision_times:
-                m = (t >= s) & (t <= s + window_years + 1.0e-9)
-                tt = t[m]
-                yy = y[m]
-                if tt.size < 2:
-                    continue
-                pts = np.column_stack([tt, yy]).astype(float)
-                segs = np.stack([pts[:-1], pts[1:]], axis=1)
-                mid_t = 0.5 * (tt[:-1] + tt[1:])
-                fade = 1.0 - np.clip((mid_t - s) / window_years, 0.0, 1.0)
-                alphas = (base_alpha * (fade**1.35)).astype(float)
-                colors = np.column_stack(
-                    [
-                        np.full_like(alphas, rgb[0]),
-                        np.full_like(alphas, rgb[1]),
-                        np.full_like(alphas, rgb[2]),
-                        alphas,
-                    ]
-                )
-                lc = LineCollection(segs, colors=colors, linewidths=float(
-                    base_lw), capstyle="round", joinstyle="round", zorder=2)
-                ax.add_collection(lc)
-
         n = len(iter_trajectories)
         best_idx = _selected_iter_index(iter_trajectories)
-
-        if plot_first_n is None:
-            n_show = n
-        else:
-            n_show = int(max(0, min(n, plot_first_n)))
-        plot_interval = int(max(1, plot_interval))
-        plot_indices = sorted(set(range(0, n_show, plot_interval)))
+        plot_indices = _training_plot_indices(n, plot_first_n, plot_interval)
 
         for i in plot_indices:
             rec = iter_trajectories[i]
             ep = rec["episode"]
             t = np.array(ep["t_years"], dtype=float)
             f = np.array(ep["f"], dtype=float)
-            color, alpha, lw = _iter_color(i, n)
-            rgb = (float(color[0]), float(color[1]), float(color[2]))
-            _add_fade_windows(ax_pf, t, f, rgb, alpha, lw)
+            _plot_training_trace(ax_pf, t, f)
 
         compare_seed = int(iter_trajectories[0].get("compare_seed", 0))
         baseline_ep = simulate_episode(
@@ -1973,14 +2239,8 @@ def _plot_f_over_time_by_iteration(
             2.0), label="RL-optimized", zorder=31, alpha=1.0,
             path_effects=_KEY_LINE_EFFECT)
 
-        fcrit = cfg.f_crit if f_crit_line is None else float(f_crit_line)
-        ax_pf.axhline(fcrit, color="tab:red",
-                      linestyle="--", linewidth=_lw(1.2))
-        ax_pf.axhline(cfg.f_1, color="tab:orange",
-                      linestyle="--", linewidth=_lw(1.0))
-        ax_pf.axhline(cfg.f_2, color="tab:purple",
-                      linestyle="--", linewidth=_lw(1.0))
-        ax_pf.set_ylim(-0.02, 1.02)
+        _draw_f_threshold_lines(ax_pf, cfg, f_crit_line=f_crit_line)
+        ax_pf.set_ylim(*_f_plot_ylim(cfg))
         ax_pf.grid(True, alpha=0.25)
 
         if _PLOT_TITLES:
@@ -1989,8 +2249,8 @@ def _plot_f_over_time_by_iteration(
         ax_pf.set_ylabel("Functionality F(t)")
         ax_pf.set_xlabel("Time (years)")
         ax_pf.set_xlim(0.0, float(cfg.horizon_years))
-        ax_pf.legend(loc="lower right", ncols=1,
-                     fontsize=_TEX_BODY_FONT_PT - 1.0)
+        ax_pf.legend(loc="lower right", ncols=1, framealpha=0.9,
+                     fontsize=_TEX_BODY_FONT_PT - 2.0, labelspacing=0.18, borderpad=0.25)
 
         fig.tight_layout()
         out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -2014,68 +2274,29 @@ def _plot_cost_over_time_by_iteration(
                 _TEX_HALF_WIDTH_IN, _TEX_HALF_WIDTH_IN * 0.72),
         )
 
-        window_years = 30.0
-        interval = float(cfg.maintenance_interval_years)
-        decision_times = np.arange(0.0, float(
-            cfg.horizon_years) + 1.0e-9, interval, dtype=float)
-
-        def _add_fade_windows(
-            ax: Any,
-            t: np.ndarray,
-            y: np.ndarray,
-            rgb: tuple[float, float, float],
-            base_alpha: float,
-            base_lw: float,
-        ) -> None:
-            for s in decision_times:
-                m = (t >= s) & (t <= s + window_years + 1.0e-9)
-                tt = t[m]
-                yy = y[m]
-                if tt.size < 2:
-                    continue
-                pts = np.column_stack([tt, yy]).astype(float)
-                segs = np.stack([pts[:-1], pts[1:]], axis=1)
-                mid_t = 0.5 * (tt[:-1] + tt[1:])
-                fade = 1.0 - np.clip((mid_t - s) / window_years, 0.0, 1.0)
-                alphas = (base_alpha * (fade**1.35)).astype(float)
-                colors = np.column_stack(
-                    [
-                        np.full_like(alphas, rgb[0]),
-                        np.full_like(alphas, rgb[1]),
-                        np.full_like(alphas, rgb[2]),
-                        alphas,
-                    ]
-                )
-                lc = LineCollection(segs, colors=colors, linewidths=float(
-                    base_lw), capstyle="round", joinstyle="round", zorder=2)
-                ax.add_collection(lc)
-
         n = len(iter_trajectories)
         if n == 0:
             return
         best_idx = _selected_iter_index(iter_trajectories)
+        plot_indices = _training_plot_indices(n, plot_first_n, plot_interval)
 
-        if plot_first_n is None:
-            n_show = n
-        else:
-            n_show = int(max(0, min(n, plot_first_n)))
-        plot_interval = int(max(1, plot_interval))
-        plot_indices = sorted(set(range(0, n_show, plot_interval)))
-
+        y_max = 0.0
         for i in plot_indices:
             rec = iter_trajectories[i]
             ep = rec["episode"]
             t = np.array(ep["t_years"], dtype=float)
             cc = np.array(ep["cumulative_cost"], dtype=float)
-            color, alpha, lw = _iter_color(i, n)
-            rgb = (float(color[0]), float(color[1]), float(color[2]))
-            _add_fade_windows(ax, t, cc, rgb, alpha, lw)
+            if cc.size:
+                y_max = max(y_max, float(np.nanmax(cc)))
+            _plot_training_trace(ax, t, cc)
 
         compare_seed = int(iter_trajectories[0].get("compare_seed", 0))
         baseline_ep = simulate_episode(
             cfg, _baseline_policy_params(), seed=compare_seed, record_hazard_steps=True)
         t_base = np.array(baseline_ep.t_years, dtype=float)
         cc_base = np.array(baseline_ep.cumulative_cost, dtype=float)
+        if cc_base.size:
+            y_max = max(y_max, float(np.nanmax(cc_base)))
         ax.plot(t_base, cc_base, color="tab:red", linewidth=_lw(
             2.0), linestyle="-", label="Fixed-rule", zorder=30, alpha=1.0,
             path_effects=_KEY_LINE_EFFECT)
@@ -2083,132 +2304,14 @@ def _plot_cost_over_time_by_iteration(
         best_ep = iter_trajectories[best_idx]["episode"]
         t_best = np.array(best_ep["t_years"], dtype=float)
         cc_best = np.array(best_ep["cumulative_cost"], dtype=float)
+        if cc_best.size:
+            y_max = max(y_max, float(np.nanmax(cc_best)))
         ax.plot(t_best, cc_best, color="tab:green", linewidth=_lw(
             2.0), label="RL-optimized", zorder=31, alpha=1.0,
             path_effects=_KEY_LINE_EFFECT)
 
         ax.set_xlim(0.0, float(cfg.horizon_years))
-        fig.canvas.draw()
-        tick_leader_w = float(plt.rcParams.get("ytick.major.width", 1.0))
-        tick_leader_len_pts = float(plt.rcParams.get("ytick.major.size", 3.5))
-        ax_bbox = ax.get_window_extent(renderer=fig.canvas.get_renderer())
-        tick_leader_len_px = tick_leader_len_pts * fig.dpi / 72.0
-        tick_leader_len_ax = float(
-            tick_leader_len_px / max(1.0, ax_bbox.width))
-        x_range = float(cfg.horizon_years)
-        tick_leader_len_data = tick_leader_len_ax * x_range
-        x_left_seg = -tick_leader_len_data
-        x_label_anchor_ax = 0.015
-        x_line_start_ax = 0.13
-
-        def _label_start_left(yv: float, *, x_to: float) -> None:
-            yv = float(yv)
-            x1 = float(max(0.0, x_to))
-            ax.plot([x_left_seg, x1], [yv, yv], color="black",
-                    linestyle=(0, (4.0, 2.0)), linewidth=_lw(1.0), clip_on=False, zorder=20)
-
-        y0_base = float(cc_base[0]) if cc_base.size else 0.0
-        y0_best = float(cc_best[0]) if cc_best.size else 0.0
-        y1_base = float(cc_base[-1]) if cc_base.size else 0.0
-        y1_best = float(cc_best[-1]) if cc_best.size else 0.0
-        if max(y1_base, y1_best) >= 100.0:
-            x_line_start_ax = 0.16
-        case_key = out_path.parent.name.lower()
-        if case_key == "case2a":
-            tick_vals = [0.0, 10.0, 30.0, 60.0, 90.0, 120.0, 130.0]
-            ax.set_yticks(tick_vals)
-            ax.set_yticklabels([str(int(v)) for v in tick_vals])
-            ax.set_ylim(0.0, 130.0)
-            major_ticks = np.array(tick_vals, dtype=float)
-        elif case_key == "case3b":
-            tick_vals = [0.0, 10.0, 30.0, 60.0, 90.0, 130.0]
-            ax.set_yticks(tick_vals)
-            ax.set_yticklabels([str(int(v)) for v in tick_vals])
-            ax.set_ylim(0.0, 130.0)
-            major_ticks = np.array(tick_vals, dtype=float)
-        elif case_key == "case3c":
-            y_top = 110.0
-            if max(y1_base, y1_best) > 108.0:
-                y_top = float(math.ceil((max(y1_base, y1_best) + 4.0) / 10.0) * 10.0)
-            tick_vals = [0.0, 10.0, 30.0, 60.0, 90.0, 110.0]
-            if y_top > 110.0:
-                tick_vals.append(y_top)
-            ax.set_yticks(tick_vals)
-            ax.set_yticklabels([str(int(v)) for v in tick_vals])
-            ax.set_ylim(0.0, y_top)
-            major_ticks = np.array(tick_vals, dtype=float)
-        else:
-            major_ticks = np.array(ax.get_yticks(), dtype=float)
-            tick_vals = sorted(
-                set([float(v) for v in major_ticks.tolist() + [y0_base]]))
-            ax.set_yticks(tick_vals)
-            tick_labels = []
-            for v in tick_vals:
-                if abs(v - y0_base) < 1.0e-6:
-                    tick_labels.append(f"{v:.1f}")
-                elif abs(v - round(v)) < 1.0e-9:
-                    tick_labels.append(f"{int(round(v))}")
-                else:
-                    tick_labels.append(f"{v:g}")
-            ax.set_yticklabels(tick_labels)
-
-        minor_ticks = []
-        for v in [y1_base, y1_best]:
-            if major_ticks.size == 0 or float(np.min(np.abs(major_ticks - float(v)))) > 1.0e-6:
-                minor_ticks.append(float(v))
-        if minor_ticks:
-            ax.set_yticks(sorted(set(minor_ticks)), minor=True)
-            ax.tick_params(axis="y", which="minor", left=True, right=False,
-                           length=tick_leader_len_pts, width=tick_leader_w, labelleft=False)
-
-        x_start_conn = min(float(t_base[0]) if t_base.size else 0.0, float(
-            t_best[0]) if t_best.size else 0.0)
-        if abs(y0_base - y0_best) <= 1.0e-9:
-            _label_start_left(y0_base, x_to=x_start_conn)
-        else:
-            _label_start_left(y0_base, x_to=x_start_conn)
-            _label_start_left(y0_best, x_to=x_start_conn)
-
-        major_now = np.array(ax.get_yticks(), dtype=float)
-        if major_now.size == 0:
-            major_now = np.array([0.0], dtype=float)
-        ylab_base = float(y1_base)
-        ylab_best = float(y1_best)
-        yoff_base = 0.0
-        yoff_best = 0.0
-        if abs(ylab_best - ylab_base) < 4.0:
-            if ylab_base >= ylab_best:
-                yoff_base = 8.0
-                yoff_best = -8.0
-            else:
-                yoff_base = -8.0
-                yoff_best = 8.0
-
-        if case_key == "case1":
-            ylab_base = float(y1_base) + 4.5
-            ylab_best = float(y1_best) - 5.3
-            yoff_base = 0.0
-            yoff_best = 0.0
-        elif case_key == "case2a":
-            yoff_best -= 6.0
-        elif case_key == "case2b":
-            ylim0, ylim1 = ax.get_ylim()
-            yspan = float(max(1.0, float(ylim1) - float(ylim0)))
-            ylab_base = float(ylim1) - 0.080 * yspan
-            ylab_best = float(ylim1) - 0.205 * yspan
-            yoff_base = 4.0
-            yoff_best = 0.0
-        elif case_key == "case3a":
-            yoff_base = 0.0
-            yoff_best = 0.0
-        elif case_key == "case3b":
-            yoff_base = 6.0
-            yoff_best = -4.0 if y1_best > 91.0 else 2.0
-        elif case_key == "case3c":
-            ylab_base = float(y1_base)
-            ylab_best = float(y1_best)
-            yoff_base = 0.0
-            yoff_best = -2.0 if y1_best > 110.0 else (-10.0 if y1_best > 91.0 else -6.0)
+        _apply_even_ylim(ax, 0.0, y_max, n_ticks=6, pad=0.01, anchor_zero=True)
 
         if _PLOT_TITLES:
             ax.set_title("Training trajectories: Cost", fontweight="bold")
@@ -2216,8 +2319,8 @@ def _plot_cost_over_time_by_iteration(
         ax.set_xlabel("Time (years)")
         ax.yaxis.labelpad = 2
         ax.grid(True, alpha=0.25)
-        ax.legend(loc="lower right", ncols=1,
-                  fontsize=_TEX_BODY_FONT_PT - 1.0)
+        ax.legend(loc="lower right", ncols=1, framealpha=0.9,
+                  fontsize=_TEX_BODY_FONT_PT - 2.0, labelspacing=0.18, borderpad=0.25)
 
         fig.tight_layout()
         out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -2298,13 +2401,7 @@ def _plot_lr_risk_over_time_by_iteration(
         if n == 0:
             return
 
-        if plot_first_n is None:
-            n_show = n
-        else:
-            n_show = int(max(0, min(n, plot_first_n)))
-        plot_interval = int(max(1, plot_interval))
-        plot_indices = sorted(set(range(0, n_show, plot_interval)))
-
+        plot_indices = _training_plot_indices(n, plot_first_n, plot_interval)
         best_idx = _selected_iter_index(iter_trajectories)
 
         def _plot_one(metric: str, title: str, y_label: str, out_path: Path) -> None:
@@ -2315,6 +2412,7 @@ def _plot_lr_risk_over_time_by_iteration(
                                          _TEX_HALF_WIDTH_IN * 0.72),
             )
 
+            y_max = 0.0
             for i in plot_indices:
                 rec = iter_trajectories[i]
                 ep = rec["episode"]
@@ -2326,9 +2424,9 @@ def _plot_lr_risk_over_time_by_iteration(
                     f_crit_eff=_effective_f_crit(cfg, pre_idx),
                 )
                 y = lr_cum if metric == "lr" else risk_cum
-                color, alpha, lw = _iter_color(i, n)
-                ax.plot(t, y, color=color, alpha=0.30,
-                        linewidth=max(0.6, float(lw)))
+                if np.size(y):
+                    y_max = max(y_max, float(np.nanmax(np.asarray(y, dtype=float))))
+                _plot_training_trace(ax, t, y)
 
             compare_seed = int(iter_trajectories[0].get("compare_seed", 0))
             base_params = _baseline_policy_params()
@@ -2341,6 +2439,8 @@ def _plot_lr_risk_over_time_by_iteration(
                 f_crit_eff=_effective_f_crit(cfg, int(base_params.pre_index)),
             )
             y0 = lr0 if metric == "lr" else risk0
+            if np.size(y0):
+                y_max = max(y_max, float(np.nanmax(np.asarray(y0, dtype=float))))
             ax.plot(t0, y0, color="tab:red", linewidth=_lw(
                 2.0), linestyle="-", label="Fixed-rule", alpha=1.0, zorder=30,
                 path_effects=_KEY_LINE_EFFECT)
@@ -2354,37 +2454,23 @@ def _plot_lr_risk_over_time_by_iteration(
                     cfg, int(best["params"]["pre_index"])),
             )
             yb = lrb if metric == "lr" else riskb
+            if np.size(yb):
+                y_max = max(y_max, float(np.nanmax(np.asarray(yb, dtype=float))))
             ax.plot(tb, yb, color="tab:green", linewidth=_lw(
                 2.0), label="RL-optimized", alpha=1.0, zorder=31,
                 path_effects=_KEY_LINE_EFFECT)
 
             ax.set_xlim(0.0, float(cfg.horizon_years))
-            try:
-                y_max = float(np.nanmax(np.concatenate(
-                    [np.asarray(y0, dtype=float), np.asarray(yb, dtype=float)])))
-            except Exception:
-                y_max = float(np.nanmax(np.asarray(y0, dtype=float))) if len(y0) else float(
-                    np.nanmax(np.asarray(yb, dtype=float))) if len(yb) else 0.0
             if not np.isfinite(y_max) or y_max < 0.0:
                 y_max = 0.0
-            if metric == "risk":
-                # Add extra headroom so thick top segments are not clipped by axes/tight bbox.
-                y_top = y_max + max(0.8, 0.06 * max(1.0, y_max)) + 0.12
-                ax.set_ylim(-0.5, y_top)
-            else:
-                # Keep visible padding at top to avoid half-clipped horizontal segments.
-                y_top = y_max * 1.08 + 0.38
-                if y_max <= 0.0:
-                    y_top = 1.0
-                ax.set_ylim(0.0, y_top)
+            _apply_even_ylim(ax, 0.0, y_max, n_ticks=6, pad=0.08, anchor_zero=True)
 
             if _PLOT_TITLES:
                 ax.set_title(title, fontweight="bold")
             ax.set_xlabel("Time (years)")
             ax.set_ylabel(y_label)
-            ax.yaxis.labelpad = 6 if metric == "risk" else 2
-            ax.yaxis.set_label_coords(-0.135 if metric == "risk" else -0.075, 0.5)
-            ax.tick_params(axis="y", pad=4 if metric == "risk" else 2)
+            ax.yaxis.labelpad = 2
+            ax.tick_params(axis="y", pad=2)
             ax.tick_params(axis="x", pad=2)
             ax.grid(True, alpha=0.25)
             legend = ax.legend(loc="upper left", ncols=1, framealpha=0.9,
@@ -2558,6 +2644,8 @@ def _plot_rl_eval_combined(
 
                 all_y_values.extend(y_best_raw.tolist())
                 all_y_values.extend(y_elite_raw.tolist())
+                all_y_values.extend((y_best_s + std_best).tolist())
+                all_y_values.extend((y_elite_s + std_elite).tolist())
 
             if _PLOT_TITLES:
                 ax.set_title(title, fontweight="bold")
@@ -2577,6 +2665,11 @@ def _plot_rl_eval_combined(
                 handlelength=1.4,
                 borderaxespad=0.25,
             )
+            if all_y_values:
+                y_hi = float(np.nanmax(all_y_values))
+                y_lo = float(np.nanmin(all_y_values))
+            else:
+                y_hi, y_lo = 1.0, 0.0
             if "reward" in out_path.name:
                 if out_path.name.endswith("reward_per_episode.png"):
                     ax.set_ylim(-38.0, -5.0)
@@ -2586,15 +2679,16 @@ def _plot_rl_eval_combined(
                 ax.legend(loc="lower right", **reward_legend_kwargs)
             else:
                 if out_path.name.endswith("cost_per_episode.png"):
-                    ax.set_ylim(20.0, 60.0)
-                    ax.set_yticks([20.0, 30.0, 40.0, 50.0, 60.0])
+                    _apply_even_ylim(ax, y_lo, y_hi, n_ticks=6, pad=0.10, anchor_zero=False)
+                elif out_path.name.endswith("lor_per_episode.png") or out_path.name.endswith("risk_per_episode.png"):
+                    _apply_even_ylim(ax, 0.0, max(y_hi, 0.0), n_ticks=6, pad=0.10, anchor_zero=True)
                 ax.legend(loc="upper right", **legend_kwargs)
 
-            left = 0.26 if fig_width <= (_TEX_HALF_WIDTH_IN + 1.0e-9) else 0.18
-            top = 0.90 if _PLOT_TITLES else 0.98
-            fig.subplots_adjust(left=left, right=0.98, bottom=0.20, top=top)
+            left = 0.16 if fig_width <= (_TEX_HALF_WIDTH_IN + 1.0e-9) else 0.12
+            top = 0.90 if _PLOT_TITLES else 0.96
+            fig.subplots_adjust(left=left, right=0.97, bottom=0.18, top=top)
             out_path.parent.mkdir(parents=True, exist_ok=True)
-            fig.savefig(out_path)
+            fig.savefig(out_path, bbox_inches="tight", pad_inches=0.04)
             plt.close(fig)
 
     def _get_loss(
@@ -2740,6 +2834,7 @@ def _coerce_lifecycle_config_dict(d: dict[str, Any]) -> dict[str, Any]:
         "fire_intensities",
         "fire_intensity_probs",
         "pre_cost_options",
+        "pre_f0_options",
         "pre_fcrit_multipliers",
         "pre_hazard_damage_multipliers",
         "pre_deterioration_multipliers",
@@ -2764,10 +2859,8 @@ def _coerce_lifecycle_config_dict(d: dict[str, Any]) -> dict[str, Any]:
     out.pop("hazard_prob_per_year", None)
 
     if "repair_recovery_caps" in out and "repair_recovery_deltas" not in out:
-        out["repair_recovery_deltas"] = (0.0, 0.25, 0.5)
+        out["repair_recovery_deltas"] = (0.0, 0.15, 0.3)
     out.pop("repair_recovery_caps", None)
-
-    out.pop("pre_f0_options", None)
     out.pop("w_c3", None)
 
     allowed = set(LifecycleConfig.__dataclass_fields__.keys())
@@ -2934,22 +3027,20 @@ def _case_run_configs(root: Path) -> list[dict[str, Any]]:
         "c_1": 1.0,
         "c_2": 4.0,
         "c_3": 10.0,
-        "deterioration_model": "weibull",
-        "det_alpha_T_levels": [0.80, 0.40, 0.20],
+        "det_alpha_T_levels": [0.80, 0.45, 0.20],
         "det_tau_years": 55.0,
         "det_k": 2.2,
-        "det_sigma": 0.0,
-        "base_deterioration_rate": 0.03,
         "maint_costs": [0.0, 0.25, 0.6],
-        "maint_rate_multipliers": [1.0, 0.7, 0.45],
         "repair_costs": [0.0, 3.0, 10.0],
-        "repair_recovery_deltas": [0.0, 0.25, 0.5],
-        "repair_recovery_rate_per_year": 0.25,
+        "repair_recovery_deltas": [0.0, 0.15, 0.3],
         "repair_durations_years": [0.0, 1.0, 1.5],
+        "pre_cost_options": [5.0, 10.0, 20.0],
+        "pre_hazard_damage_multipliers": [1.0, 0.95, 0.88],
+        "eq_intensities": [0.10, 0.30, 0.60],
+        "fire_intensities": [0.10, 0.20, 0.30],
         "discount_rate": 0.03,
-        "objective_cost_metric": "lcc",
-        "w_floor": 0.0,
-        "repair_stop_years": 0.0,
+        "objective_cost_metric": "npv",
+        "record_dt_years": 0.25,
     }
 
     base_cem: dict[str, Any] = {
@@ -3416,8 +3507,6 @@ def main() -> None:
             plot_first_n=cem_cfg.plot_first_n,
             plot_interval=cem_cfg.plot_interval,
         )
-        _plot_rl_eval_combined({case_name: d["history"]}, {
-                               case_name: d.get("lifecycle_config", {})}, fig_dir)
         logger.info("Replot done | case=%s from_json=%s",
                     case_name, str(out_json))
         return
@@ -3475,8 +3564,6 @@ def main() -> None:
         plot_first_n=cem_cfg.plot_first_n,
         plot_interval=cem_cfg.plot_interval,
     )
-    _plot_rl_eval_combined({case_name: results["history"]}, {
-                           case_name: results.get("lifecycle_config", {})}, fig_dir)
     logger.info("Run done | case=%s wrote_json=%s", case_name, str(out_json))
 
 

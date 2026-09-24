@@ -2,7 +2,11 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-python_bin="${repo_root}/.venv/bin/python"
+if [[ -x "${repo_root}/.venv/bin/python" ]]; then
+  python_bin="${repo_root}/.venv/bin/python"
+else
+  python_bin="${PYTHON:-python3}"
+fi
 code_dir="${repo_root}/code/RL_Code"
 
 cd "${repo_root}"
@@ -11,22 +15,13 @@ export MPLCONFIGDIR="${repo_root}/.mplconfig"
 
 echo "=== Experiment suite started: $(date -Is) ==="
 
-echo "=== Main lifecycle cases ==="
+echo "=== Main lifecycle cases (1, 2a, 2b, 3a, 3b, 3c) ==="
 "${python_bin}" -u "${code_dir}/train_lifecycle_rl.py" all
-
-echo "=== Case 4 weight-reallocation variants ==="
-for config in \
-  "${code_dir}/lcc_rerun/case4_weight_reallocation/configs/case4a_no_resilience_equal.json" \
-  "${code_dir}/lcc_rerun/case4_weight_reallocation/configs/case4b_no_resilience_risk_replacement.json" \
-  "${code_dir}/lcc_rerun/case4_weight_reallocation/configs/case4c_no_risk_cost_emphasis.json"
-do
-  "${python_bin}" -u "${code_dir}/train_lifecycle_rl.py" "${config}"
-done
 
 echo "=== Ablation variants ==="
 "${python_bin}" -u "${code_dir}/ablation_experiment.py" --holdout-episodes 400
 
-echo "=== GA/PSO baseline comparison ==="
+echo "=== GA/PSO/CEM threshold-policy comparison ==="
 "${python_bin}" -u "${code_dir}/optimizer_baseline_experiment.py" \
   --config "${code_dir}/lcc_rerun/configs/case1_baseline.json" \
   --out-dir "${code_dir}/lcc_rerun/optimizer_baselines" \
@@ -36,5 +31,14 @@ echo "=== Uncertainty evaluation (N=400) ==="
 "${python_bin}" -u "${code_dir}/evaluate_uncertainty.py" \
   --episodes 400 \
   --out-dir "${code_dir}/lcc_rerun/uncertainty_results"
+
+echo "=== Optional sequential PPO reference (same budget as CEM) ==="
+"${python_bin}" -u "${code_dir}/train_deeprl_ppo.py" \
+  --config "${code_dir}/lcc_rerun/configs/case1_baseline.json" \
+  --out-dir "${code_dir}/lcc_rerun/deeprl_ppo" \
+  --episodes 480000
+
+echo "=== Combined training-curve figures ==="
+"${python_bin}" -u "${code_dir}/plot_lcc_combined.py"
 
 echo "=== Experiment suite completed: $(date -Is) ==="

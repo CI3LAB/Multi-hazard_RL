@@ -5,8 +5,13 @@ import math
 from pathlib import Path
 
 import matplotlib.gridspec as gridspec
+from matplotlib import font_manager
 import matplotlib.pyplot as plt
 import numpy as np
+
+_TIMES_NEW_ROMAN_PATH = Path("/usr/share/fonts/truetype/msttcorefonts/Times_New_Roman.ttf")
+if _TIMES_NEW_ROMAN_PATH.exists():
+    font_manager.fontManager.addfont(str(_TIMES_NEW_ROMAN_PATH))
 
 
 ROOT = Path(__file__).resolve().parent
@@ -58,6 +63,42 @@ PALETTE = {
 
 def _lw(x: float) -> float:
     return float(x) * float(LINEWIDTH_SCALE)
+
+
+def _nice_linear_axis(
+    y_min: float,
+    y_max: float,
+    *,
+    n_ticks: int = 6,
+    pad: float = 0.08,
+    anchor_zero: bool = False,
+) -> tuple[float, float, np.ndarray]:
+    lo = float(y_min) if np.isfinite(float(y_min)) else 0.0
+    hi = float(y_max) if np.isfinite(float(y_max)) else lo + 1.0
+    if hi <= lo:
+        hi = lo + 1.0
+    span = hi - lo
+    lo_p = lo - float(pad) * span
+    hi_p = hi + float(pad) * span
+    if anchor_zero and lo >= 0.0:
+        lo_p = 0.0
+    raw_step = (hi_p - lo_p) / float(max(2, int(n_ticks) - 1))
+    if raw_step <= 0.0:
+        raw_step = 1.0
+    mag = 10.0 ** math.floor(math.log10(raw_step))
+    step = mag
+    for mult in (1.0, 2.0, 2.5, 5.0, 10.0):
+        if mult * mag >= raw_step * 0.9:
+            step = mult * mag
+            break
+    lo_tick = math.floor(lo_p / step) * step
+    if anchor_zero and lo >= 0.0:
+        lo_tick = 0.0
+    hi_tick = math.ceil(hi_p / step) * step
+    if hi_tick <= lo_tick:
+        hi_tick = lo_tick + step
+    ticks = np.arange(lo_tick, hi_tick + 0.5 * step, step, dtype=float)
+    return float(lo_tick), float(hi_tick), ticks
 
 
 def _tex_rc_params() -> dict[str, object]:
@@ -146,7 +187,7 @@ def _series(history: list[dict[str, object]], key: str) -> tuple[np.ndarray, np.
         best = np.array([float(h["best_of_iter"]["return"]) for h in history], dtype=float)
         elite = np.array([float(h["elite_mean"]["return"]) for h in history], dtype=float)
         return iters, best, elite
-    metric_key = "lcc" if key == "cost" else key
+    metric_key = "npv" if key == "cost" else key
     best = np.array([float(h["best_of_iter"][metric_key]) for h in history], dtype=float)
     elite = np.array([float(h["elite_mean"][metric_key]) for h in history], dtype=float)
     return iters, best, elite
@@ -158,9 +199,15 @@ def _apply_y_limits(ax: plt.Axes, key: str, all_y: list[float]) -> None:
     ymax = float(np.nanmax(all_y))
     ymin = float(np.nanmin(all_y))
     if key == "cost":
-        ax.set_ylim(top=max(140.0, ymax * 1.05))
-    elif key == "risk":
-        ax.set_ylim(bottom=min(-5.0, ymin * 1.05))
+        lo, hi, ticks = _nice_linear_axis(
+            ymin, ymax, n_ticks=6, pad=0.10, anchor_zero=False)
+        ax.set_ylim(lo, hi)
+        ax.set_yticks(ticks)
+    elif key in {"lr", "risk"}:
+        lo, hi, ticks = _nice_linear_axis(
+            0.0, max(ymax, 0.0), n_ticks=6, pad=0.10, anchor_zero=True)
+        ax.set_ylim(lo, hi)
+        ax.set_yticks(ticks)
     elif key == "reward":
         pad = max(2.0, 0.08 * (ymax - ymin))
         ax.set_ylim(ymin - pad, ymax + pad)
@@ -200,6 +247,10 @@ def _draw_metric(
         all_x.extend(iters.tolist())
         all_y.extend(best_raw.tolist())
         all_y.extend(elite_raw.tolist())
+        all_y.extend((best_s - std_best).tolist())
+        all_y.extend((best_s + std_best).tolist())
+        all_y.extend((elite_s - std_elite).tolist())
+        all_y.extend((elite_s + std_elite).tolist())
 
     ax.set_xlabel("Iteration")
     ax.set_ylabel(y_label)
@@ -229,9 +280,9 @@ def _save_single(
         fig, ax = plt.subplots(1, 1, figsize=(TEX_HALF_WIDTH_IN, TEX_HALF_WIDTH_IN * 0.72))
         _draw_metric(ax, histories, key=key, y_label=y_label,
                      legend_loc=legend_loc, legend_ncols=legend_ncols)
-        fig.subplots_adjust(left=0.26, right=0.98, bottom=0.20, top=0.98)
+        fig.subplots_adjust(left=0.16, right=0.97, bottom=0.18, top=0.96)
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        fig.savefig(out_path)
+        fig.savefig(out_path, bbox_inches="tight", pad_inches=0.04)
         plt.close(fig)
 
 
@@ -258,10 +309,10 @@ def _save_five_panel(histories: dict[str, list[dict[str, object]]], out_path: Pa
                          legend_loc=legend_loc, legend_ncols=legend_ncols)
             ax.text(0.5, -0.28, caption, transform=ax.transAxes,
                     ha="center", va="top")
-        fig.subplots_adjust(left=0.10, right=0.98, bottom=0.07, top=0.98,
-                            wspace=0.48, hspace=0.88)
+        fig.subplots_adjust(left=0.08, right=0.99, bottom=0.08, top=0.98,
+                            wspace=0.36, hspace=0.80)
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        fig.savefig(out_path)
+        fig.savefig(out_path, bbox_inches="tight", pad_inches=0.05)
         plt.close(fig)
 
 

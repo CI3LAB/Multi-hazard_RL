@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import shutil
 from dataclasses import replace
 from datetime import datetime
@@ -137,7 +138,6 @@ def _display_variant_name(name: str) -> str:
         "baseline_full": "Default",
         "no_risk_term": "No risk",
         "no_resilience_term": "No resilience",
-        "no_resilience_risk_compensated": "No resilience\n(risk-comp.)",
         "no_cost_term": "No cost",
         "no_pre_reinforcement": "No pre-reinforcement",
         "no_maintenance": "No maintenance",
@@ -212,24 +212,17 @@ def _variants(base: tl.LifecycleConfig) -> list[dict[str, Any]]:
             "cfg": replace(base, w_lr=0.0, w_risk=0.5, w_cost=0.5),
         },
         {
-            "name": "no_resilience_risk_compensated",
-            "desc": "Remove resilience-loss term with risk-compensated weights, w=(resilience, cost, risk)=(0.00, 0.33, 0.67).",
-            "cfg": replace(base, w_lr=0.0, w_risk=2.0 / 3.0, w_cost=1.0 / 3.0),
-        },
-        {
             "name": "no_cost_term",
             "desc": "Remove cost term from reward.",
             "cfg": replace(base, w_lr=0.5, w_risk=0.5, w_cost=0.0),
         },
         {
             "name": "no_pre_reinforcement",
-            "desc": "Disable pre-reinforcement effect and pre-cost differentiation.",
+            "desc": "Disable pre-reinforcement damage reduction and pre-cost differentiation.",
             "cfg": replace(
                 base,
-                pre_cost_options=(10.0, 10.0, 10.0),
-                pre_fcrit_multipliers=(1.0, 1.0, 1.0),
+                pre_cost_options=(5.0, 5.0, 5.0),
                 pre_hazard_damage_multipliers=(1.0, 1.0, 1.0),
-                pre_deterioration_multipliers=(1.0, 1.0, 1.0),
             ),
         },
         {
@@ -265,14 +258,27 @@ def _best_params_from_result(result: dict[str, Any]) -> tl.PolicyParams:
     )
 
 
+def _safe_ref(value: Any) -> float:
+    ref = abs(float(value))
+    if not np.isfinite(ref) or ref <= 1.0e-12:
+        return 1.0
+    return ref
+
+
 def _reported_return_from_terms(metrics: dict[str, Any], cfg: dict[str, Any]) -> float:
-    """Raw scalarisation used for paper-comparable ablation return plots."""
+    """Normalized scalarisation used by CEM training (Eq. 16)."""
     w_lr = float(cfg.get("w_lr", 1.0 / 3.0))
     w_risk = float(cfg.get("w_risk", 1.0 / 3.0))
     w_cost = float(cfg.get("w_cost", 1.0 / 3.0))
     lr = float(metrics["lr"])
     risk = float(metrics["risk"])
-    cost = float(metrics.get("lcc", metrics.get("npv", 0.0)))
+    cost_metric = str(cfg.get("objective_cost_metric", "npv")).strip().lower()
+    cost = float(metrics.get("npv" if cost_metric == "npv" else "lcc", metrics.get("npv", metrics.get("lcc", 0.0))))
+    mode = str(cfg.get("objective_normalization", "reference")).strip().lower()
+    if mode in {"reference", "ref", "normalized", "normalised"}:
+        lr /= _safe_ref(cfg.get("lr_ref", 1.0))
+        risk /= _safe_ref(cfg.get("risk_ref", 1.0))
+        cost /= _safe_ref(cfg.get("cost_ref", 1.0))
     return float(-(w_lr * lr + w_risk * risk + w_cost * cost))
 
 
@@ -282,7 +288,11 @@ def _ensure_reported_return(record: dict[str, Any]) -> None:
         cfg = {}
     for key in ("best_eval_train", "best_eval_holdout"):
         metrics = record.get(key)
-        if isinstance(metrics, dict):
+        if not isinstance(metrics, dict):
+            continue
+        if "return" in metrics:
+            metrics["reported_return"] = float(metrics["return"])
+        else:
             metrics["reported_return"] = _reported_return_from_terms(metrics, cfg)
 
 
@@ -295,12 +305,7 @@ def _weight_string(cfg: dict[str, Any]) -> str:
 
 
 def _main_ablation_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return [
-        rec for rec in records
-        if str(rec.get("name", "")) not in {
-            "no_resilience_risk_compensated",
-        }
-    ]
+    return [rec for rec in records if str(rec.get("name", "")) != "no_resilience_risk_compensated"]
 
 
 def _weight_sensitivity_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -308,18 +313,7 @@ def _weight_sensitivity_records(records: list[dict[str, Any]]) -> list[dict[str,
 
 
 def _resilience_sensitivity_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    wanted = {
-        "baseline_full",
-        "no_resilience_term",
-        "no_resilience_risk_compensated",
-    }
-    picked = [rec for rec in records if str(rec.get("name", "")) in wanted]
-    order = {
-        "baseline_full": 0,
-        "no_resilience_term": 1,
-        "no_resilience_risk_compensated": 2,
-    }
-    return sorted(picked, key=lambda rec: order.get(str(rec.get("name", "")), 999))
+    return []
 
 
 def _weight_preference_case_specs(script_dir: Path) -> list[dict[str, Any]]:
@@ -432,12 +426,9 @@ def _weight_preference_records(
                 holdout_episodes=int(holdout_episodes),
                 holdout_seed=int(holdout_seed),
             )
-        # For the weight-preference analysis, the primary return should follow
-        # the normalized objective actually used in training/evaluation rather
-        # than the paper-comparable raw scalarisation used in the ablation view.
         for key in ("best_eval_train", "best_eval_holdout"):
             metrics = rec.get(key)
-            if isinstance(metrics, dict):
+            if isinstance(metrics, dict) and "return" in metrics:
                 metrics["reported_return"] = float(metrics["return"])
         records.append(rec)
     return records
@@ -493,20 +484,27 @@ def _metric_axis_spec(metric_key: str, vals: np.ndarray) -> dict[str, Any]:
         return {
             "scale": "symlog",
             "scale_kwargs": {"linthresh": 1.0, "linscale": 1.0, "base": 10},
-            "ymin": -320.0,
+            "ymin": -200.0,
             "ymax": 0.0,
             "label_suffix": " symlog",
-            "ticks": [-300.0, -100.0, -30.0, -10.0, -3.0, -1.0, 0.0],
+            "ticks": [-150.0, -50.0, -10.0, -5.0, -3.0, -1.0, 0.0],
         }
 
-    if metric_key == "lcc":
+    if metric_key in {"lcc", "npv"}:
+        vmax = float(np.nanmax(vals)) if vals.size else 80.0
+        if not math.isfinite(vmax) or vmax <= 0.0:
+            vmax = 80.0
+        hi = vmax * 1.22
+        step = 20.0 if hi > 60.0 else 10.0
+        ymax = float(math.ceil(hi / step) * step)
+        ticks = list(np.arange(0.0, ymax + 0.5 * step, step, dtype=float))
         return {
             "scale": "linear",
             "scale_kwargs": {},
             "ymin": 0.0,
-            "ymax": 120.0,
+            "ymax": ymax,
             "label_suffix": "",
-            "ticks": list(np.arange(0.0, 121.0, 20.0)),
+            "ticks": ticks,
         }
 
     positive = vals[vals > 0.0]
@@ -563,7 +561,7 @@ def _metric_annotation_override(
 ) -> dict[str, Any] | None:
     if metric_key == "reported_return" and variant_name == "no_repair":
         return {"xytext": (-48, 8), "ha": "right", "va": "bottom"}
-    if metric_key == "lcc":
+    if metric_key in {"lcc", "npv"}:
         if panel_kind == "single":
             overrides = {
                 "baseline_full": {"xytext": (-28, 12), "ha": "center", "va": "bottom"},
@@ -635,6 +633,7 @@ def _run_one_variant(
             "floor_ref": float(cfg.floor_ref),
             "w_floor": float(cfg.w_floor),
             "pre_cost_options": list(map(float, cfg.pre_cost_options)),
+            "pre_f0_options": list(map(float, cfg.pre_f0_options)),
             "pre_fcrit_multipliers": list(map(float, cfg.pre_fcrit_multipliers)),
             "pre_hazard_damage_multipliers": list(
                 map(float, cfg.pre_hazard_damage_multipliers)
@@ -671,7 +670,7 @@ def _run_one_variant(
         name,
         float(holdout["return"]),
         float(holdout["risk"]),
-        float(holdout["lcc"]),
+        float(holdout["npv"]),
     )
     return payload
 
@@ -767,7 +766,7 @@ def _metric_specs() -> list[tuple[str, str, bool, str, str]]:
         ("reported_return", "Return", True, "ablation_metric_return.png", "(a) Return"),
         ("lr", "Resilience loss", False, "ablation_metric_lr.png", "(b) Resilience loss"),
         ("risk", "Risk", False, "ablation_metric_risk.png", "(c) Risk"),
-        ("lcc", "Cost", False, "ablation_metric_cost.png", "(d) Cost"),
+        ("npv", "Cost", False, "ablation_metric_cost.png", "(d) Cost"),
     ]
 
 
@@ -888,6 +887,7 @@ def _copy_key_ablation_figures(out_dir: Path, *, dst_subdir: str = "") -> None:
         "ablation_metric_npv.png",
         "ablation_metrics.png",
         "ablation_tradeoff.png",
+        "ablation_tradeoff_unlabeled.png",
     ]
     for name in fig_names:
         src = src_dir / name
@@ -920,9 +920,10 @@ def _plot_tradeoff(
     out_path: Path,
     *,
     bubble_scale: dict[str, Any] | None = None,
+    annotate_labels: bool = True,
 ) -> None:
     names = [str(r["name"]) for r in records]
-    cost = np.array([float(r["best_eval_holdout"]["lcc"]) for r in records], dtype=float)
+    cost = np.array([float(r["best_eval_holdout"]["npv"]) for r in records], dtype=float)
     risk = np.array([float(r["best_eval_holdout"]["risk"]) for r in records], dtype=float)
     lr = np.array([float(r["best_eval_holdout"]["lr"]) for r in records], dtype=float)
     ret = np.array([_metric_value(r, "reported_return") for r in records], dtype=float)
@@ -960,18 +961,7 @@ def _plot_tradeoff(
         ax.yaxis.set_major_locator(mticker.FixedLocator([1.0, 10.0, 100.0, 1000.0]))
         ax.yaxis.set_major_formatter(mticker.FuncFormatter(_plain_log_tick))
         ax.yaxis.set_minor_locator(mticker.NullLocator())
-    if name_set == {"baseline_full", "no_resilience_term", "no_resilience_risk_compensated"}:
-        label_offsets = {
-            "baseline_full": (26, -6),
-            "no_resilience_term": (22, 18),
-            "no_resilience_risk_compensated": (-30, 12),
-        }
-        label_align = {
-            "baseline_full": ("left", "center"),
-            "no_resilience_term": ("left", "bottom"),
-            "no_resilience_risk_compensated": ("right", "bottom"),
-        }
-    elif name_set == {"baseline_equal", "cost_oriented", "risk_oriented", "resilience_oriented"}:
+    if name_set == {"baseline_equal", "cost_oriented", "risk_oriented", "resilience_oriented"}:
         label_offsets = {
             "baseline_equal": (20, -10),
             "cost_oriented": (-24, 12),
@@ -990,32 +980,33 @@ def _plot_tradeoff(
             "no_risk_term": (10, 10),
             "no_resilience_term": (-25, -14),
             "no_cost_term": (14, 0),
-            "no_pre_reinforcement": (-12, 10),
+            "no_pre_reinforcement": (14, 16),
             "no_maintenance": (10, 8),
-            "no_repair": (10, -8),
+            "no_repair": (14, -10),
         }
         label_align = {
             "baseline_full": ("left", "top"),
             "no_risk_term": ("left", "bottom"),
             "no_resilience_term": ("right", "top"),
             "no_cost_term": ("left", "center"),
-            "no_pre_reinforcement": ("right", "top"),
+            "no_pre_reinforcement": ("left", "bottom"),
             "no_maintenance": ("left", "bottom"),
             "no_repair": ("left", "top"),
         }
-    for i, name in enumerate(names):
-        dx, dy = label_offsets.get(name, (8, 8))
-        ha, va = label_align.get(name, ("left", "bottom"))
-        ax.annotate(
-            _display_variant_name(name),
-            xy=(display_cost[i], display_risk[i]),
-            xytext=(dx, dy),
-            textcoords="offset points",
-            fontsize=_font("trade_label"),
-            ha=ha,
-            va=va,
-            annotation_clip=False,
-        )
+    if annotate_labels:
+        for i, name in enumerate(names):
+            dx, dy = label_offsets.get(name, (8, 8))
+            ha, va = label_align.get(name, ("left", "bottom"))
+            ax.annotate(
+                _display_variant_name(name),
+                xy=(display_cost[i], display_risk[i]),
+                xytext=(dx, dy),
+                textcoords="offset points",
+                fontsize=_font("trade_label"),
+                ha=ha,
+                va=va,
+                annotation_clip=False,
+            )
 
     cbar = fig.colorbar(scatter_ref, ax=ax, pad=0.03, fraction=0.05)
     cbar.set_label("Holdout return", rotation=90, fontsize=_font("trade_cbar_label"))
@@ -1044,14 +1035,43 @@ def _plot_tradeoff(
         title_fontsize=_font("trade_bubble_legend_title"),
     )
 
-    ax.set_xlim(25.0, 125.0)
-    ax.xaxis.set_major_locator(mticker.FixedLocator([30.0, 50.0, 70.0, 90.0, 110.0]))
+    cmin = float(np.nanmin(display_cost)) if display_cost.size else 0.0
+    cmax = float(np.nanmax(display_cost)) if display_cost.size else 100.0
+    span = max(cmax - cmin, 1.0)
+    x_lo = max(0.0, cmin - 0.18 * span)
+    x_hi = cmax + 0.18 * span
+    x_span = max(x_hi - x_lo, 1.0)
+    raw_step = x_span / 5.0
+    mag = 10.0 ** math.floor(math.log10(raw_step)) if raw_step > 0 else 10.0
+    x_step = mag
+    for mult in (1.0, 2.0, 2.5, 5.0, 10.0):
+        if mult * mag >= raw_step * 0.9:
+            x_step = mult * mag
+            break
+    x_lo = math.floor(x_lo / x_step) * x_step
+    x_hi = math.ceil(x_hi / x_step) * x_step
+    ax.set_xlim(x_lo, x_hi)
+    ax.xaxis.set_major_locator(mticker.FixedLocator(
+        list(np.arange(x_lo, x_hi + 0.5 * x_step, x_step))))
     ax.set_xlabel("Cost", fontsize=_font("trade_axis"))
     ax.set_ylabel("Risk log", fontsize=_font("trade_axis"))
     fig.tight_layout()
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path, dpi=260, bbox_inches="tight")
     plt.close(fig)
+
+
+def _plot_tradeoff_pair(
+    records: list[dict[str, Any]],
+    out_path: Path,
+    *,
+    bubble_scale: dict[str, Any] | None = None,
+) -> None:
+    _plot_tradeoff(
+        records, out_path, bubble_scale=bubble_scale, annotate_labels=True)
+    unlabeled = out_path.with_name(f"{out_path.stem}_unlabeled{out_path.suffix}")
+    _plot_tradeoff(
+        records, unlabeled, bubble_scale=bubble_scale, annotate_labels=False)
 
 
 def _build_report(
@@ -1061,7 +1081,7 @@ def _build_report(
     *,
     title: str = "Ablation Study Report",
     note_lines: list[str] | None = None,
-    return_note: str = "Return is reported with the paper-comparable raw scalarisation of LR, risk, and cost under each ablation weight setting.",
+    return_note: str = "Return is the normalized holdout objective used in CEM training (weighted LR, risk, and cost after reference scaling).",
 ) -> None:
     baseline = records[0]["best_eval_holdout"]
     baseline_return = _metric_value(records[0], "reported_return")
@@ -1094,7 +1114,7 @@ def _build_report(
         m = rec["best_eval_holdout"]
         cfg = rec.get("cfg", {})
         lines.append(
-            f"| {rec['name']} | {_weight_string(cfg)} | {_metric_value(rec, 'reported_return'):.4f} | {float(m['lr']):.3f} | {float(m['risk']):.3f} | {float(m['lcc']):.2f} | {float(m['min_f']):.3f} | {float(m['feasible_frac']):.3f} |"
+            f"| {rec['name']} | {_weight_string(cfg)} | {_metric_value(rec, 'reported_return'):.4f} | {float(m['lr']):.3f} | {float(m['risk']):.3f} | {float(m['npv']):.2f} | {float(m['min_f']):.3f} | {float(m['feasible_frac']):.3f} |"
         )
     lines.append("")
     lines.append("## Relative To Baseline")
@@ -1104,7 +1124,7 @@ def _build_report(
     for rec in records[1:]:
         m = rec["best_eval_holdout"]
         lines.append(
-            f"| {rec['name']} | {_metric_value(rec, 'reported_return') - baseline_return:+.4f} | {float(m['lr']) - float(baseline['lr']):+.3f} | {float(m['risk']) - float(baseline['risk']):+.3f} | {float(m['lcc']) - float(baseline['lcc']):+.2f} |"
+            f"| {rec['name']} | {_metric_value(rec, 'reported_return') - baseline_return:+.4f} | {float(m['lr']) - float(baseline['lr']):+.3f} | {float(m['risk']) - float(baseline['risk']):+.3f} | {float(m['npv']) - float(baseline['npv']):+.2f} |"
         )
     lines.append("")
     lines.append("## Quick Findings")
@@ -1117,10 +1137,10 @@ def _build_report(
     lines.append(
         f"- Lowest risk: `{best_risk['name']}` ({float(best_risk['best_eval_holdout']['risk']):.3f}); highest risk: `{worst_risk['name']}` ({float(worst_risk['best_eval_holdout']['risk']):.3f})."
     )
-    best_cost = min(records, key=lambda r: float(r["best_eval_holdout"]["lcc"]))
-    worst_cost = max(records, key=lambda r: float(r["best_eval_holdout"]["lcc"]))
+    best_cost = min(records, key=lambda r: float(r["best_eval_holdout"]["npv"]))
+    worst_cost = max(records, key=lambda r: float(r["best_eval_holdout"]["npv"]))
     lines.append(
-        f"- Lowest cost: `{best_cost['name']}` ({float(best_cost['best_eval_holdout']['lcc']):.2f}); highest cost: `{worst_cost['name']}` ({float(worst_cost['best_eval_holdout']['lcc']):.2f})."
+        f"- Lowest cost: `{best_cost['name']}` ({float(best_cost['best_eval_holdout']['npv']):.2f}); highest cost: `{worst_cost['name']}` ({float(worst_cost['best_eval_holdout']['npv']):.2f})."
     )
     lines.append("")
     lines.append("## Figures")
@@ -1128,7 +1148,8 @@ def _build_report(
     lines.append("- `ablation_metric_return.png`, `ablation_metric_lr.png`, `ablation_metric_risk.png`, `ablation_metric_cost.png`: metric-wise bar comparisons.")
     lines.append("- `ablation_metrics.png`: 2x2 metric panel.")
     lines.append("- `ablation_convergence.png`: best-of-iteration return curves.")
-    lines.append("- `ablation_tradeoff.png`: risk-cost trade-off scatter.")
+    lines.append("- `ablation_tradeoff.png`: risk-cost trade-off scatter with bubble labels.")
+    lines.append("- `ablation_tradeoff_unlabeled.png`: the same scatter without bubble labels.")
     lines.append("")
     (out_dir / "ablation_report.md").write_text("\n".join(lines), encoding="utf-8")
 
@@ -1149,7 +1170,7 @@ def _render_weight_preference_analysis(
     bubble_scale = _global_lr_scale(records)
     _plot_metric_panels(records, out_dir)
     _plot_convergence(records, out_dir / "ablation_convergence.png")
-    _plot_tradeoff(records, out_dir / "ablation_tradeoff.png", bubble_scale=bubble_scale)
+    _plot_tradeoff_pair(records, out_dir / "ablation_tradeoff.png", bubble_scale=bubble_scale)
     _copy_key_ablation_figures(out_dir, dst_subdir="weight_preference_cases")
     _build_report(
         records,
@@ -1243,21 +1264,21 @@ def run_ablation(
 
     _plot_metric_panels(main_records, out_dir)
     _plot_convergence(main_records, out_dir / "ablation_convergence.png")
-    _plot_tradeoff(main_records, out_dir / "ablation_tradeoff.png", bubble_scale=bubble_scale)
+    _plot_tradeoff_pair(main_records, out_dir / "ablation_tradeoff.png", bubble_scale=bubble_scale)
     _copy_key_ablation_figures(out_dir)
 
     if weight_records:
         weight_dir = out_dir / "weight_sensitivity"
         _plot_metric_panels(weight_records, weight_dir)
         _plot_convergence(weight_records, weight_dir / "ablation_convergence.png")
-        _plot_tradeoff(weight_records, weight_dir / "ablation_tradeoff.png", bubble_scale=bubble_scale)
+        _plot_tradeoff_pair(weight_records, weight_dir / "ablation_tradeoff.png", bubble_scale=bubble_scale)
         _copy_key_ablation_figures(weight_dir, dst_subdir="weight_sensitivity")
 
     if resilience_records:
         resilience_dir = out_dir / "resilience_sensitivity"
         _plot_metric_panels(resilience_records, resilience_dir)
         _plot_convergence(resilience_records, resilience_dir / "ablation_convergence.png")
-        _plot_tradeoff(resilience_records, resilience_dir / "ablation_tradeoff.png", bubble_scale=bubble_scale)
+        _plot_tradeoff_pair(resilience_records, resilience_dir / "ablation_tradeoff.png", bubble_scale=bubble_scale)
         _copy_key_ablation_figures(resilience_dir, dst_subdir="resilience_sensitivity")
 
     summary_payload = {
@@ -1289,7 +1310,6 @@ def run_ablation(
             "holdout_episodes": int(holdout_episodes),
         },
         note_lines=[
-            "The supplemental no-resilience risk-compensated case uses w=(resilience, cost, risk)=(0.00, 0.33, 0.67) and is plotted separately under `resilience_sensitivity/`.",
             "All trade-off figures use one shared global bubble-size scale based on LR across the full ablation set.",
         ],
     )
@@ -1365,19 +1385,19 @@ def redraw_only_from_results(*, out_root: Path, results_json: Path | None = None
     run_time = str(payload.get("run_time", "plot_only"))
     _plot_metric_panels(main_records, out_dir)
     _plot_convergence(main_records, out_dir / "ablation_convergence.png")
-    _plot_tradeoff(main_records, out_dir / "ablation_tradeoff.png", bubble_scale=bubble_scale)
+    _plot_tradeoff_pair(main_records, out_dir / "ablation_tradeoff.png", bubble_scale=bubble_scale)
     _copy_key_ablation_figures(out_dir)
     if weight_records:
         weight_dir = out_dir / "weight_sensitivity"
         _plot_metric_panels(weight_records, weight_dir)
         _plot_convergence(weight_records, weight_dir / "ablation_convergence.png")
-        _plot_tradeoff(weight_records, weight_dir / "ablation_tradeoff.png", bubble_scale=bubble_scale)
+        _plot_tradeoff_pair(weight_records, weight_dir / "ablation_tradeoff.png", bubble_scale=bubble_scale)
         _copy_key_ablation_figures(weight_dir, dst_subdir="weight_sensitivity")
     if resilience_records:
         resilience_dir = out_dir / "resilience_sensitivity"
         _plot_metric_panels(resilience_records, resilience_dir)
         _plot_convergence(resilience_records, resilience_dir / "ablation_convergence.png")
-        _plot_tradeoff(resilience_records, resilience_dir / "ablation_tradeoff.png", bubble_scale=bubble_scale)
+        _plot_tradeoff_pair(resilience_records, resilience_dir / "ablation_tradeoff.png", bubble_scale=bubble_scale)
         _copy_key_ablation_figures(resilience_dir, dst_subdir="resilience_sensitivity")
     _build_report(
         main_records,
@@ -1391,7 +1411,6 @@ def redraw_only_from_results(*, out_root: Path, results_json: Path | None = None
             "holdout_episodes": int(settings.get("holdout_episodes", 0)),
         },
         note_lines=[
-            "The supplemental no-resilience risk-compensated case uses w=(resilience, cost, risk)=(0.00, 0.33, 0.67) and is plotted separately under `resilience_sensitivity/`.",
             "All trade-off figures use one shared global bubble-size scale based on LR across the full ablation set.",
         ],
     )

@@ -12,6 +12,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib import font_manager
 
+import evaluate_uncertainty as unc
 import train_lifecycle_rl as tl
 
 
@@ -136,15 +137,13 @@ def _evaluate_population(
     episodes: int,
 ) -> list[dict[str, float]]:
     base_seed_it = int(seed + iteration * 7919)
-    return [
-        _evaluate_vector(
-            cfg,
-            population[j],
-            base_seed=int(base_seed_it + j * 131),
-            episodes=int(episodes),
-        )
-        for j in range(population.shape[0])
-    ]
+    params = [_decode(population[j]) for j in range(int(population.shape[0]))]
+    return tl.evaluate_policy_population(
+        cfg,
+        params,
+        base_seed_it=base_seed_it,
+        episodes=int(episodes),
+    )
 
 
 def _score_order(scores: list[dict[str, float]]) -> list[int]:
@@ -351,81 +350,93 @@ def run_pso(
     }
 
 
-def _reported_return(metrics: dict[str, float], cfg: tl.LifecycleConfig) -> float:
-    cost = float(metrics.get("lcc", metrics.get("npv", 0.0)))
-    return float(-(cfg.w_lr * metrics["lr"] + cfg.w_risk * metrics["risk"] + cfg.w_cost * cost))
-
-
-def _load_cem_record(cfg: tl.LifecycleConfig, opt: OptimizerConfig) -> dict[str, Any] | None:
-    path = LCC_ROOT / "ablation_results" / "baseline_full" / "ablation_summary.json"
+def _load_cem_record(
+    cfg: tl.LifecycleConfig,
+    opt: OptimizerConfig,
+    *,
+    summary_path: Path | None = None,
+) -> dict[str, Any] | None:
+    path = Path(summary_path) if summary_path is not None else (
+        LCC_ROOT / "ablation_results" / "baseline_full" / "ablation_summary.json"
+    )
     if not path.exists():
         return None
     raw = json.loads(path.read_text(encoding="utf-8"))
     params = tl.PolicyParams(**dict(raw["best_params"]))
-    holdout = tl._evaluate_params(  # type: ignore[attr-defined]
+    return _attach_holdout(
         cfg,
-        params,
-        base_seed=int(opt.holdout_seed),
-        episodes=int(opt.holdout_episodes),
+        opt,
+        {
+            "method": "CEM",
+            "best_params": asdict(params),
+            "source": str(path),
+            "history": raw.get("history", []),
+        },
     )
-    holdout = dict(holdout)
-    holdout["reported_return"] = _reported_return(holdout, cfg)
-    return {
-        "method": "CEM",
-        "best_params": asdict(params),
-        "best_eval_holdout_common": holdout,
-        "source": str(path),
-        "history": raw.get("history", []),
-    }
 
 
 def _fixed_record(cfg: tl.LifecycleConfig, opt: OptimizerConfig) -> dict[str, Any]:
     params = tl._baseline_policy_params()  # type: ignore[attr-defined]
-    holdout = tl._evaluate_params(  # type: ignore[attr-defined]
+    return _attach_holdout(
         cfg,
-        params,
-        base_seed=int(opt.holdout_seed),
-        episodes=int(opt.holdout_episodes),
+        opt,
+        {
+            "method": "Fixed heuristic",
+            "best_params": asdict(params),
+            "history": [],
+        },
     )
-    holdout = dict(holdout)
-    holdout["reported_return"] = _reported_return(holdout, cfg)
-    return {
-        "method": "Fixed heuristic",
-        "best_params": asdict(params),
-        "best_eval_holdout_common": holdout,
-        "history": [],
-    }
 
 
 def _attach_holdout(cfg: tl.LifecycleConfig, opt: OptimizerConfig, result: dict[str, Any]) -> dict[str, Any]:
     params = tl.PolicyParams(**dict(result["best_params"]))
-    holdout = tl._evaluate_params(  # type: ignore[attr-defined]
+    holdout = unc.holdout_with_uncertainty(
         cfg,
         params,
         base_seed=int(opt.holdout_seed),
         episodes=int(opt.holdout_episodes),
     )
-    holdout = dict(holdout)
-    holdout["reported_return"] = _reported_return(holdout, cfg)
     out = dict(result)
     out["best_eval_holdout_common"] = holdout
     return out
 
 
+def _unc_pair(holdout: dict[str, Any], key: str) -> tuple[float, float]:
+    stats = dict(holdout.get("uncertainty", {})).get(key, {})
+    if isinstance(stats, dict) and "mean" in stats:
+        return float(stats["mean"]), float(stats.get("ci_halfwidth", 0.0))
+    mapped = {"npv": "npv", "reported_return": "reported_return", "return": "return"}
+    return float(holdout[mapped.get(key, key)]), 0.0
+
+
 def _write_summary(records: list[dict[str, Any]], out_dir: Path) -> None:
     rows: list[dict[str, Any]] = []
+    n_ep = 0
     for rec in records:
         h = dict(rec["best_eval_holdout_common"])
+        ret_m, ret_hw = _unc_pair(h, "reported_return")
+        obj_m, obj_hw = _unc_pair(h, "return")
+        lr_m, lr_hw = _unc_pair(h, "lr")
+        risk_m, risk_hw = _unc_pair(h, "risk")
+        cost_m, cost_hw = _unc_pair(h, "npv")
+        minf_m, minf_hw = _unc_pair(h, "min_f")
+        n_ep = int(dict(h.get("uncertainty", {})).get("episodes", n_ep) or n_ep)
         rows.append(
             {
                 "method": rec["method"],
-                "objective_return": float(h["return"]),
-                "reported_return": float(h["reported_return"]),
-                "lr": float(h["lr"]),
-                "risk": float(h["risk"]),
+                "objective_return": obj_m,
+                "objective_return_ci": obj_hw,
+                "reported_return": ret_m,
+                "reported_return_ci": ret_hw,
+                "lr": lr_m,
+                "lr_ci": lr_hw,
+                "risk": risk_m,
+                "risk_ci": risk_hw,
                 "lcc": float(h["lcc"]),
-                "npv": float(h["npv"]),
-                "min_f": float(h["min_f"]),
+                "npv": cost_m,
+                "npv_ci": cost_hw,
+                "min_f": minf_m,
+                "min_f_ci": minf_hw,
                 "feasible_frac": float(h["feasible_frac"]),
                 "params": json.dumps(rec["best_params"], ensure_ascii=False),
             }
@@ -435,15 +446,19 @@ def _write_summary(records: list[dict[str, Any]], out_dir: Path) -> None:
         writer = csv.DictWriter(fh, fieldnames=list(rows[0].keys()))
         writer.writeheader()
         writer.writerows(rows)
+    n_label = n_ep if n_ep > 0 else int(rows[0].get("n", 400) if rows else 400)
     lines = [
         "Optimizer baseline holdout summary (common random seeds)",
+        f"Uncertainty: mean ± 95% CI half-width (N={n_label} independent lifecycle episodes)",
+        "Return is the normalized training objective used by CEM/GA/PSO.",
         "",
-        "Method | Objective return | Reported return | LR | Risk | Cost | Min F",
+        "Method | Return | Resilience loss | Risk | Cost | Min F",
     ]
     for r in rows:
         lines.append(
-            f"{r['method']} | {r['objective_return']:.4f} | {r['reported_return']:.4f} | "
-            f"{r['lr']:.3f} | {r['risk']:.3f} | {r['lcc']:.2f} | {r['min_f']:.3f}"
+            f"{r['method']} | {unc._fmt(r['objective_return'], r['objective_return_ci'], 4)} | "
+            f"{unc._fmt(r['lr'], r['lr_ci'], 3)} | {unc._fmt(r['risk'], r['risk_ci'], 3)} | "
+            f"{unc._fmt(r['npv'], r['npv_ci'], 2)} | {unc._fmt(r['min_f'], r['min_f_ci'], 3)}"
         )
     (out_dir / "optimizer_baseline_summary.txt").write_text(
         "\n".join(lines) + "\n",
@@ -488,6 +503,40 @@ def _plot_convergence(records: list[dict[str, Any]], out_dir: Path) -> None:
         plt.close(fig)
 
 
+def _save_experiment(
+    *,
+    config_path: Path,
+    out_dir: Path,
+    opt: OptimizerConfig,
+    records: list[dict[str, Any]],
+) -> None:
+    for rec in records:
+        (out_dir / f"{str(rec['method']).lower().replace(' ', '_')}_result.json").write_text(
+            json.dumps(rec, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    (out_dir / "optimizer_baseline_results.json").write_text(
+        json.dumps(
+            {
+                "config_path": str(config_path),
+                "optimizer_config": {
+                    "iterations": int(opt.iterations),
+                    "population": int(opt.population),
+                    "eval_episodes": int(opt.eval_episodes),
+                    "holdout_episodes": int(opt.holdout_episodes),
+                    "common_holdout_seed": int(opt.holdout_seed),
+                },
+                "records": records,
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    _write_summary(records, out_dir)
+    _plot_convergence(records, out_dir)
+
+
 def run_experiment(
     *,
     config_path: Path,
@@ -496,6 +545,7 @@ def run_experiment(
     population: int,
     eval_episodes: int,
     holdout_episodes: int,
+    cem_summary: Path | None = None,
 ) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     logger = _setup_logger(out_dir)
@@ -521,35 +571,39 @@ def run_experiment(
     fixed = _fixed_record(cfg, opt_ga)
     ga = _attach_holdout(cfg, opt_ga, run_ga(cfg, opt_ga, logger=logger))
     pso = _attach_holdout(cfg, opt_pso, run_pso(cfg, opt_pso, logger=logger))
-    cem = _load_cem_record(cfg, opt_ga)
+    cem = _load_cem_record(cfg, opt_ga, summary_path=cem_summary)
     records = [fixed, ga, pso] + ([cem] if cem is not None else [])
-
-    for rec in records:
-        (out_dir / f"{str(rec['method']).lower().replace(' ', '_')}_result.json").write_text(
-            json.dumps(rec, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-    (out_dir / "optimizer_baseline_results.json").write_text(
-        json.dumps(
-            {
-                "config_path": str(config_path),
-                "optimizer_config": {
-                    "iterations": int(iterations),
-                    "population": int(population),
-                    "eval_episodes": int(eval_episodes),
-                    "holdout_episodes": int(holdout_episodes),
-                    "common_holdout_seed": int(opt_ga.holdout_seed),
-                },
-                "records": records,
-            },
-            ensure_ascii=False,
-            indent=2,
-        ),
-        encoding="utf-8",
-    )
-    _write_summary(records, out_dir)
-    _plot_convergence(records, out_dir)
+    _save_experiment(config_path=config_path, out_dir=out_dir, opt=opt_ga, records=records)
     logger.info("Optimizer baseline done | out_dir=%s", out_dir)
+
+
+def refresh_holdout_uncertainty(
+    *,
+    config_path: Path,
+    out_dir: Path,
+    holdout_episodes: int | None = None,
+) -> None:
+    result_path = out_dir / "optimizer_baseline_results.json"
+    raw = json.loads(result_path.read_text(encoding="utf-8"))
+    cfg, cem_cfg = _load_cfg(config_path)
+    opt_raw = dict(raw.get("optimizer_config", {}))
+    opt = OptimizerConfig(
+        iterations=int(opt_raw.get("iterations", 200)),
+        population=int(opt_raw.get("population", 80)),
+        eval_episodes=int(opt_raw.get("eval_episodes", 30)),
+        holdout_episodes=int(holdout_episodes or opt_raw.get("holdout_episodes", 400)),
+        seed=int(cem_cfg.seed + 1_000_000),
+        holdout_seed=int(opt_raw.get("common_holdout_seed", cem_cfg.seed + 900_000)),
+    )
+    logger = _setup_logger(out_dir)
+    logger.info(
+        "Refreshing optimizer holdout uncertainty | episodes=%d seed=%d",
+        opt.holdout_episodes,
+        opt.holdout_seed,
+    )
+    records = [_attach_holdout(cfg, opt, dict(rec)) for rec in list(raw["records"])]
+    _save_experiment(config_path=config_path, out_dir=out_dir, opt=opt, records=records)
+    logger.info("Holdout uncertainty refresh done | out_dir=%s", out_dir)
 
 
 def main() -> None:
@@ -561,15 +615,34 @@ def main() -> None:
     parser.add_argument("--eval-episodes", type=int, default=30)
     parser.add_argument("--holdout-episodes", type=int, default=400)
     parser.add_argument(
+        "--cem-summary",
+        type=str,
+        default="",
+        help="Optional CEM ablation_summary.json used in the optimizer comparison.",
+    )
+    parser.add_argument(
         "--plot-only",
         action="store_true",
         help="Redraw the convergence figure from saved optimizer results.",
     )
+    parser.add_argument(
+        "--evaluate-only",
+        action="store_true",
+        help="Recompute holdout mean ± 95% CI for saved GA/PSO/CEM policies without retraining.",
+    )
     args = parser.parse_args()
+    out_dir = Path(args.out_dir).resolve()
     if bool(args.plot_only):
-        result_path = Path(args.out_dir).resolve() / "optimizer_baseline_results.json"
+        result_path = out_dir / "optimizer_baseline_results.json"
         raw = json.loads(result_path.read_text(encoding="utf-8"))
-        _plot_convergence(list(raw["records"]), Path(args.out_dir).resolve())
+        _plot_convergence(list(raw["records"]), out_dir)
+        return
+    if bool(args.evaluate_only):
+        refresh_holdout_uncertainty(
+            config_path=Path(args.config).resolve(),
+            out_dir=out_dir,
+            holdout_episodes=int(args.holdout_episodes),
+        )
         return
     run_experiment(
         config_path=Path(args.config).resolve(),
@@ -578,6 +651,7 @@ def main() -> None:
         population=int(args.population),
         eval_episodes=int(args.eval_episodes),
         holdout_episodes=int(args.holdout_episodes),
+        cem_summary=Path(args.cem_summary).resolve() if str(args.cem_summary).strip() else None,
     )
 
 

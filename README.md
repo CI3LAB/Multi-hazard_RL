@@ -2,47 +2,52 @@
 
 Lifecycle management of infrastructure under multi-recurrent hazards using simulation-informed modelling and CEM-based threshold-policy search.
 
-This repository provides the source code, case configurations, and paper results for the lifecycle cases, sensitivity/ablation analysis, uncertainty evaluation, and CEM–GA–PSO comparison.
+This repository contains the **adopted** training framework and the paper results. 
+## Adopted model
 
-## Key parameters
-
-| Item | Value |
+| Item | Adopted value |
 |---|---|
-| Fire rates (baseline / fire-dominant / earthquake-dominant) | `0.20 / 0.40 / 0.10` per year |
-| Earthquake rates (baseline / fire-dominant / earthquake-dominant) | `0.025 / 0.0125 / 0.05` per year |
-| Maintenance costs | `[0.0, 0.25, 0.6]` |
-| Deterioration rates `det_alpha_T_levels` | `[0.8, 0.4, 0.2]` |
-| Repair recovery rate | `0.25 / year` |
-| Repair durations | `[0.0, 1.0, 1.5]` years |
-| CEM settings | 200 iterations, population 80, 30 evaluation episodes |
-| Holdout / uncertainty episodes | 400 |
+| Pre-reinforcement | Costs `5 / 10 / 20`; hazard-damage multipliers `1.00 / 0.95 / 0.88`|
+| Earthquake / fire rates | Baseline `(0.025, 0.20)`; fire-dominant `(0.0125, 0.40)`; earthquake-dominant `(0.05, 0.10)` per year |
+| Intensity mix | Low / medium / high = `0.60 / 0.30 / 0.10` |
+| Earthquake ΔF | `0.10 / 0.30 / 0.60` |
+| Fire ΔF | `0.10 / 0.20 / 0.30` |
+| Weibull deterioration `α_T` | `[0.80, 0.45, 0.20]` for maintenance levels 0 / 1 / 2; `τ = 55` years, `k = 2.2` |
+| Maintenance costs | `[0.0, 0.25, 0.6]` every 10 years |
+| Repair | Recovery `0 / 0.15 / 0.30` over `0 / 1.0 / 1.5` years; costs `[0, 3, 10]` |
+| Risk | `F_crit / F1 / F2 = 0.70 / 0.50 / 0.30`; penalties `1 / 4 / 10`; plus an instantaneous jump term at hazard drops |
+| Discount | `γ = 0.03` on cost (NPV) only; resilience loss and risk are undiscounted |
+| Objective | Weighted sum of reference-normalized LR, risk, and NPV; feasibility penalty weight = 0 |
+| CEM | 200 iterations, population 80, 30 eval episodes; per-`pre_index` Gaussians; delayed elitist after 25% of iterations; `σ` floor `0.08 → 0.02` |
+| Holdout | `N = 400` common seeds |
 
-See `results/RL_Code/lcc_rerun/PARAMETERS.json`.
+Figures 5–10 plot **undiscounted lifecycle cash** (`LCC`). Tables that report Cost use **NPV**. See `results/RL_Code/lcc_rerun/PARAMETERS.json`.
 
-## Repository layout
+## Layout
 
 ```
-code/RL_Code/                 # source code and case configs
-results/RL_Code/lcc_rerun/    # figures and numerical summaries
+code/RL_Code/                 training code and case configs
+results/RL_Code/lcc_rerun/    paper figures and numerical summaries
 ```
 
-### Main scripts
+`code/RL_Code/lcc_rerun` is a symlink to `results/RL_Code/lcc_rerun`, so training writes into the results tree.
 
-- `train_lifecycle_rl.py` — lifecycle simulation, CEM training, and case plotting
-- `ablation_experiment.py` — sensitivity and ablation analysis
-- `optimizer_baseline_experiment.py` — GA / PSO / CEM comparison
-- `evaluate_uncertainty.py` — mean ± 95% CI half-width evaluation
-- `plot_lcc_combined.py` — training-dynamics figures
-- `run_all_experiments.sh` — sequential experiment suite
+### Scripts
 
-### Results
+- `train_lifecycle_rl.py` — lifecycle environment, CEM, and case figures
+- `plot_lcc_combined.py` — six-case training/evaluation curves
+- `ablation_experiment.py` — objective-sensitivity and intervention ablation
+- `optimizer_baseline_experiment.py` — fixed-rule / GA / PSO / CEM on the same threshold policy
+- `evaluate_uncertainty.py` — holdout mean ± 95% CI
+- `train_deeprl_ppo.py` — sequential PPO reference (appendix); not the reported inspection policy
+- `run_all_experiments.sh` — full suite
 
-- Case 1–3 lifecycle figures
-- Training-dynamics panels
-- Ablation metric bars and multi-objective trade-off
-- Uncertainty table
-- Optimizer comparison summary
-- Result JSON files with configs, best parameters, holdout metrics, and training history
+### Results in this snapshot
+
+- Cases 1, 2a, 2b, 3a, 3b, 3c: functionality / cost / resilience-loss / risk trajectories
+- Combined training curves
+- Ablation bars and trade-off (no risk-compensated variant)
+- Optimizer comparison with uncertainty, plus PPO holdout numbers
 
 ## Environment
 
@@ -52,21 +57,30 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
+`torch` is optional for CEM evaluation speed and required only for the PPO reference.
+
 ## Usage
 
 ```bash
 export PYTHONPATH="$PWD/code/RL_Code"
 export MPLCONFIGDIR="$PWD/.mplconfig"
 
-# Full experiment suite
+# Full suite (long)
 bash code/RL_Code/run_all_experiments.sh
 
-# Replot ablation figures from existing results
+# Train the six paper cases
+python code/RL_Code/train_lifecycle_rl.py all
+
+# Replot case figures from saved JSON
+python code/RL_Code/train_lifecycle_rl.py all --replot
+
+# Replot ablation figures
 python code/RL_Code/ablation_experiment.py --plot-only \
   --out-root results/RL_Code/lcc_rerun/ablation_results
 ```
 
 ## Notes
 
-- Return values in objective-sensitivity cases use each case’s own weight setting and should not be ranked across different weight formulations.
-- Optimizer comparison uses a common holdout seed set under the baseline lifecycle configuration.
+- Objective-sensitivity Return values use each variant’s own weights and should not be ranked across formulations.
+- Optimizer comparison uses a common holdout seed set under the Case 1 environment.
+- PPO attains a higher holdout return but is a sequential black-box policy, so CEM remains the reported solver for the inspectable threshold rule.
